@@ -63,8 +63,8 @@ for split in "${splits[@]}"; do
             trainer.args.gradient_checkpointing=true
 
             # Eval
-            CUDA_VISIBLE_DEVICES=0 python src/eval.py \
-            experiment=eval/tofu/default.yaml \
+            CUDA_VISIBLE_DEVICES=0 python src/eval.py --config-name=eval.yaml \
+            experiment=eval/tofu/default \
             forget_split=${forget_split} \
             holdout_split=${holdout_split} \
             model=${model} \

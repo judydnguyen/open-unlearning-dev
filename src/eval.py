@@ -16,7 +16,9 @@ def main(cfg: DictConfig):
     model_cfg = cfg.model
     template_args = model_cfg.template_args
     assert model_cfg is not None, "Invalid model yaml passed in train config."
+    print(f"Model config: {model_cfg}")
     model, tokenizer = get_model(model_cfg)
+    
 
     eval_cfgs = cfg.eval
     evaluators = get_evaluators(eval_cfgs)

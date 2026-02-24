@@ -1,0 +1,130 @@
+#!/bin/bash
+
+# Test script for LatentUnlearning method
+# This script tests the LatentUnlearning implementation on TOFU benchmark
+
+set -e  # Exit on error
+
+export MASTER_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
+echo "Master Port: $MASTER_PORT"
+
+# Configuration
+MODEL="Llama-3.2-1B-Instruct"  # Start with smaller model for testing
+FORGET_SPLIT="forget10"
+RETAIN_SPLIT="retain90"
+HOLDOUT_SPLIT="holdout10"
+TASK_NAME="latent_per_sample_v1.4"
+MODEL_PATH="open-unlearning/tofu_${MODEL}_full"
+
+# LatentUnlearning-specific parameters
+INTERVENTION_LAYER=7        # Layer index where intervention is applied (middle layer for Llama-3.2-1B)
+LAMBDA_UTIL=1.0             # Utility preservation loss weight
+MU_ORTH=1.0                 # Orthogonality loss weight
+RHO_NORM=0.1                # Norm regularization weight
+C=1.0                       # Bounding constant for steering vector
+LATENT_DIM=256              # Dimension of latent space for DeepSets encoder
+KL_LAST_TOKEN_ONLY=true     # Compute utility KL on last token only (memory-friendly)
+
+# Note: retain_pca_basis is optional and can be computed separately
+# For initial testing, we'll set it to null (no orthogonality constraint)
+# To use PCA basis, you would need to compute it from retain set activations first
+
+echo "=========================================="
+echo "Testing LatentUnlearning Method"
+echo "=========================================="
+echo "Model: ${MODEL}"
+echo "Forget Split: ${FORGET_SPLIT}"
+echo "Retain Split: ${RETAIN_SPLIT}"
+echo "Task Name: ${TASK_NAME}"
+echo "Model Path: ${MODEL_PATH}"
+echo "Intervention Layer: ${INTERVENTION_LAYER}"
+echo "Lambda Util: ${LAMBDA_UTIL}"
+echo "Mu Orth: ${MU_ORTH}"
+echo "Rho Norm: ${RHO_NORM}"
+echo "C (bounding constant): ${C}"
+echo "Latent Dim: ${LATENT_DIM}"
+echo "=========================================="
+
+# Check if CUDA is available
+if ! command -v nvidia-smi &> /dev/null; then
+    echo "Warning: nvidia-smi not found. Make sure CUDA is available."
+fi
+
+# Step 1: Run Unlearning
+echo ""
+echo "Step 1: Running LatentUnlearning..."
+echo "-----------------------------------"
+
+forget_warmup_steps=50
+CUDA_VISIBLE_DEVICES=3 python src/train.py --config-name=unlearn.yaml \
+    experiment=unlearn/tofu/default \
+    trainer=LatentUnlearning \
+    task_name=${TASK_NAME} \
+    model=${MODEL} \
+    forget_split=${FORGET_SPLIT} \
+    retain_split=${RETAIN_SPLIT} \
+    model.model_args.pretrained_model_name_or_path=${MODEL_PATH} \
+    retain_logs_path=saves/eval/tofu_${MODEL}_${RETAIN_SPLIT}/TOFU_EVAL.json \
+    trainer.method_args.intervention_layer=${INTERVENTION_LAYER} \
+    trainer.method_args.lambda_util=${LAMBDA_UTIL} \
+    trainer.method_args.mu_orth=${MU_ORTH} \
+    trainer.method_args.rho_norm=${RHO_NORM} \
+    trainer.method_args.forget_warmup_steps=${forget_warmup_steps} \
+    trainer.method_args.c=${C} \
+    trainer.method_args.latent_dim=${LATENT_DIM} \
+    trainer.method_args.kl_last_token_only=${KL_LAST_TOKEN_ONLY} \
+    trainer.args.per_device_train_batch_size=2 \
+    trainer.args.gradient_accumulation_steps=4 \
+    trainer.args.ddp_find_unused_parameters=true \
+    trainer.args.gradient_checkpointing=true
+
+if [ $? -ne 0 ]; then
+    echo "Error: Unlearning failed!"
+    exit 1
+fi
+
+echo ""
+echo "Unlearning completed successfully!"
+echo "Model saved to: saves/unlearn/${TASK_NAME}"
+
+# Step 2: Run Evaluation
+echo ""
+echo "Step 2: Running evaluation..."
+echo "-----------------------------------"
+
+CUDA_VISIBLE_DEVICES=0 python src/eval.py \
+    --config-name=eval.yaml \
+    experiment=eval/tofu/default \
+    forget_split=${FORGET_SPLIT} \
+    holdout_split=${HOLDOUT_SPLIT} \
+    model=${MODEL} \
+    task_name=${TASK_NAME} \
+    model.model_args.pretrained_model_name_or_path=saves/unlearn/${TASK_NAME} \
+    paths.output_dir=saves/unlearn/${TASK_NAME}/evals \
+    retain_logs_path=saves/eval/tofu_${MODEL}_${RETAIN_SPLIT}/TOFU_EVAL.json
+
+if [ $? -ne 0 ]; then
+    echo "Error: Evaluation failed!"
+    exit 1
+fi
+
+echo ""
+echo "=========================================="
+echo "LatentUnlearning Test Completed Successfully!"
+echo "=========================================="
+echo "Results saved to: saves/unlearn/${TASK_NAME}/evals"
+echo ""
+echo "To view results, check:"
+echo "  - Model checkpoint: saves/unlearn/${TASK_NAME}"
+echo "  - Evaluation results: saves/unlearn/${TASK_NAME}/evals"
+echo ""
+echo "Note: LatentUnlearning learns a mapping network that produces"
+echo "      a steering vector to intervene at layer ${INTERVENTION_LAYER}."
+echo "      The method only trains the mapping network parameters,"
+echo "      keeping the main model frozen."
+echo ""
+echo "Optional: To use PCA basis for orthogonality constraint,"
+echo "          compute it from retain set activations and pass it"
+echo "          via trainer.method_args.retain_pca_basis"
+echo ""
+
