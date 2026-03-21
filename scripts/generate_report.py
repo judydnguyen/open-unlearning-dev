@@ -17,6 +17,14 @@ import re
 import glob
 from pathlib import Path
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _MPL = True
+except ImportError:
+    _MPL = False
+
 
 SUMMARY_METRICS = [
     "model_utility",
@@ -233,6 +241,50 @@ def fmt(val, precision=4):
     return str(val)
 
 
+PLOT_METRICS = [
+    ("model_utility",      "Model Utility",      "tab:blue"),
+    ("forget_truth_ratio", "Forget Truth Ratio",  "tab:orange"),
+    ("forget_Q_A_Prob",    "Forget Q/A Prob",     "tab:red"),
+    ("forget_quality",     "Forget Quality",      "tab:green"),
+]
+
+
+def _plot_metrics(checkpoints, exp_dir, best_step=None):
+    """Plot TOFU_SUMMARY metrics over training steps. Returns saved path or None."""
+    if not _MPL or not checkpoints:
+        return None
+
+    steps = []
+    series = {key: [] for key, _, _ in PLOT_METRICS}
+
+    for step, path in checkpoints:
+        data = load_json(path)
+        steps.append(step)
+        for key, _, _ in PLOT_METRICS:
+            series[key].append(data.get(key))
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    for key, label, color in PLOT_METRICS:
+        vals = series[key]
+        if any(v is not None for v in vals):
+            ax.plot(steps, vals, label=label, color=color, marker="o", markersize=3)
+
+    if best_step is not None:
+        ax.axvline(best_step, color="gray", linestyle="--", linewidth=0.8, label=f"best (step {best_step})")
+
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Score")
+    ax.set_title("TOFU Metrics Over Training")
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    out = os.path.join(exp_dir, "metrics_plot.png")
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+    return out
+
+
 def generate_report(exp_dir, baseline_dirs=None):
     checkpoints = find_checkpoints(exp_dir)
     if not checkpoints:
@@ -358,6 +410,12 @@ def generate_report(exp_dir, baseline_dirs=None):
                     w(f"- ROUGE-L recall: {ex['rouge_l']:.3f}")
                 w("")
     w("")
+
+    # ---- Metrics plot ----
+    plot_path = _plot_metrics(checkpoints, exp_dir, best_step)
+    if plot_path:
+        w("## Metrics Over Training\n")
+        w(f"![Metrics]({os.path.basename(plot_path)})\n")
 
     # ---- Latent vector plots ----
     plots = []

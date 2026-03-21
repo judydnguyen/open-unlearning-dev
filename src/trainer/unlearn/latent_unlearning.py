@@ -282,6 +282,7 @@ class LatentUnlearning(UnlearnTrainer):
         max_steering_norm: float = 5.0,
         centroid_noise: float = 0.0,
         repulsion_weight: float = 0.0,
+        lambda_div: float = 1.0,
         *args,
         **kwargs,
     ):
@@ -312,6 +313,7 @@ class LatentUnlearning(UnlearnTrainer):
         self.max_steering_norm = max_steering_norm
         self.centroid_noise = centroid_noise
         self.repulsion_weight = repulsion_weight
+        self.lambda_div = lambda_div
         self._phase = 1
         self.ref_model = None
 
@@ -816,14 +818,12 @@ class LatentUnlearning(UnlearnTrainer):
         Phase 1: Train encoder to produce steering vectors.
 
         Total loss:
-          L = L_forget + λ L_util + μ L_orth + ρ L_norm
+        L = L_forget + lambda_div * L_div
 
-        Forget objective is *suppression* of the provided forget labels,
-        i.e., minimize log p(y_f | x_f, +r_ℓ). Implemented as NEGATIVE CE:
-          L_forget = - CE(logits, y_f)
-        so minimizing L_forget decreases p(y_f).
+        Forget objective: anchor r_ells to pooled forget activations (sample-specific grounding)
+        Diversity objective: maximize variance of retain projections across batch
+                            so aggregate steering cancels in retain space -> retain safety emerges naturally
         """
-        # Ensure mapping networks are in training mode
         self.encoder.train()
         self.mapping_network.train()
         if self.attention_pooling is not None:
@@ -841,116 +841,67 @@ class LatentUnlearning(UnlearnTrainer):
             "attention_mask": retain_inputs.get("attention_mask", None),
         }
 
-        # ---- Step 1: Summarize forget set (frozen activations) ----
-        # Use the first intervention layer for activation extraction
-        with torch.no_grad():
-            h_forget = self._extract_layer_activations(
-                self.model, forget_batch, self.intervention_layers[0], requires_grad=False
-            )
+        layer_idx = self.intervention_layers[0]
 
-        # Ensure mapping networks are on the same device as activations
-        device = h_forget.device
+        # ---- Step 1: Extract and pool forget activations (frozen) ----
+        with torch.no_grad():
+            h_forget, _ = self._forward_with_cache(
+                self.model, forget_batch, layer_idx, no_grad=True
+            )  # (batch, seq, hidden)
+            h_forget = h_forget.detach().float()
+
+            forget_attn_mask = forget_batch.get("attention_mask", None)
+            if forget_attn_mask is not None:
+                forget_mask_f = forget_attn_mask.float().unsqueeze(-1)
+                h_forget_pooled = (h_forget * forget_mask_f).sum(dim=1) / forget_mask_f.sum(dim=1).clamp(min=1)
+            else:
+                h_forget_pooled = h_forget.mean(dim=1)  # (batch, hidden)
+
+        # ---- Step 2: Encode forget samples -> steering vectors ----
+        device = h_forget_pooled.device
         if next(self.encoder.parameters()).device != device:
             self.encoder.to(device)
             self.mapping_network.to(device)
             if self.attention_pooling is not None:
                 self.attention_pooling.to(device)
 
-        z_f = self.encoder(h_forget)           # (batch, latent_dim)
-        r_ells = self.mapping_network(z_f)     # (batch, hidden) or list of (batch, hidden)
+        z_f = self.encoder(h_forget_pooled)       # (batch, latent_dim)
+        r_ells = self.mapping_network(z_f)        # (batch, hidden) or list
 
-        # Normalize to list for consistent handling
         if isinstance(r_ells, torch.Tensor):
             r_ells_list = [r_ells]
         else:
             r_ells_list = r_ells
 
-        # ---- Step 2: Update online PCA with retain activations ----
+        # ---- Step 3: Update online PCA with retain activations ----
         if self.online_pca is not None:
             with torch.no_grad():
-                h_retain = self._extract_layer_activations(
-                    self.model, retain_batch, self.intervention_layers[0], requires_grad=False
+                h_retain, _ = self._forward_with_cache(
+                    self.model, retain_batch, layer_idx, no_grad=True
                 )
                 self.online_pca.update(h_retain)
 
-        # ---- Step 3: Forget loss — MSE between frozen activations and r_ells target ----
-        # Train encoder so r_ells becomes the misdirection target for forget activations.
-        # Model is frozen, so gradients flow only through r_ells -> encoder.
-        layer_idx = self.intervention_layers[0]
-        with torch.no_grad():
-            model_forget_activations, _ = self._forward_with_cache(
-                self.model, forget_batch, layer_idx, no_grad=True
-            )
-            model_forget_activations = model_forget_activations.detach().float()
+        # ---- Step 4: Forget grounding loss ----
+        # Anchor r_ells to forget activations so mapping is sample-specific
+        # and grounded — encoder can't collapse to a constant vector
+        loss_forget = F.mse_loss(r_ells_list[0].float(), h_forget_pooled.detach())
 
-        # Expand per-sample r_ells to match activation shape (batch, seq, hidden)
-        control_vec = r_ells_list[0].float().unsqueeze(1)  # (batch, 1, hidden)
-        control_vec = control_vec.expand_as(model_forget_activations)
-
-        forget_mask = forget_inputs.get("labels", forget_inputs["input_ids"]) != -100
-        loss_forget = self._compute_activation_loss(
-            model_forget_activations, control_vec, forget_mask
-        )
-
-        # ---- Step 4: Utility preservation on retain set: KL(p_base || p_steer) ----
-        with torch.no_grad():
-            outputs_base = self.model(**{k: v for k, v in retain_batch.items() if k != "labels"})
-            logits_base = outputs_base.logits if hasattr(outputs_base, "logits") else (outputs_base[0] if isinstance(outputs_base, tuple) else outputs_base)
-
-        # Use mean steering vector across forget batch for retain utility check
-        if isinstance(r_ells, torch.Tensor):
-            r_ells_mean = r_ells.mean(dim=0)   # (hidden,)
-        else:
-            r_ells_mean = [r.mean(dim=0) for r in r_ells]  # list of (hidden,)
-        logits_steer = self._forward_with_intervention(self.model, retain_batch, r_ells_mean)
-
-        if self.kl_last_token_only:
-            # Memory-friendly: KL only on last token distribution
-            logits_base_ = logits_base[:, -1, :].detach()
-            logits_steer_ = logits_steer[:, -1, :]
-            p_base = F.softmax(logits_base_, dim=-1)
-            loss_util = F.kl_div(
-                F.log_softmax(logits_steer_, dim=-1),
-                p_base,
-                reduction="batchmean",
-                log_target=False,
-            )
-        else:
-            # Full KL over all tokens (can be expensive)
-            p_base = F.softmax(logits_base.detach(), dim=-1)
-            loss_util = F.kl_div(
-                F.log_softmax(logits_steer, dim=-1),
-                p_base,
-                reduction="batchmean",
-                log_target=False,
-            )
-
-        # ---- Step 5: Localization (orthogonality) ----
-        # Use pre-computed basis or online PCA basis
+        # ---- Step 5: Diversity loss over retain projections ----
+        # Maximize variance of r_ells projected onto retain subspace across batch
+        # -> retain components cancel in aggregate -> retain safety emerges naturally
         pca_basis = self.retain_pca_basis
         if pca_basis is None and self.online_pca is not None:
-            pca_basis = self.online_pca.get_basis()
+            pca_basis = self.online_pca.get_basis()  # (hidden, n_components)
 
-        if pca_basis is not None:
-            # Mean orthogonality loss across batch and layers
-            loss_orth = r_ells_list[0].new_zeros(1).squeeze()
-            for r_ell in r_ells_list:
-                # r_ell: (batch, hidden), pca_basis: (hidden, n_components)
-                projected = torch.matmul(r_ell, pca_basis)  # (batch, n_components)
-                loss_orth = loss_orth + torch.mean(torch.sum(projected ** 2, dim=-1))
+        if pca_basis is not None and r_ells_list[0].size(0) > 1:
+            projected = torch.matmul(r_ells_list[0].float(), pca_basis)  # (batch, n_components)
+            loss_div = -projected.var(dim=0).mean()  # maximize variance across batch
         else:
-            loss_orth = r_ells_list[0].new_zeros(1).squeeze() * 0.0
+            loss_div = r_ells_list[0].new_zeros(1).squeeze() * 0.0
 
-        # ---- Step 6: Norm regularization (mean per-sample norm) ----
-        loss_norm = r_ells_list[0].new_zeros(1).squeeze()
-        for r_ell in r_ells_list:
-            # r_ell: (batch, hidden) — mean of per-sample squared norms
-            loss_norm = loss_norm + torch.mean(torch.sum(r_ell ** 2, dim=-1))
+        # ---- Step 6: Total loss ----
+        loss = loss_forget + self.lambda_div * loss_div
 
-        # ---- Step 7: Total loss ----
-        loss = loss_forget + self.lambda_util * loss_util + self.mu_orth * loss_orth + self.rho_norm * loss_norm
-
-        # Debug logging (every 100 steps)
         if self.state.global_step % 100 == 0:
             r_norm_avg = sum(r.detach().norm(p=2, dim=-1).mean().item() for r in r_ells_list) / len(r_ells_list)
             logger.info(
@@ -958,22 +909,18 @@ class LatentUnlearning(UnlearnTrainer):
                 f"layers={self.intervention_layers}, "
                 f"r_norm_avg={r_norm_avg:.4f}, "
                 f"loss_forget={loss_forget.detach().item():.4f}, "
-                f"loss_util={loss_util.detach().item():.4f}, "
-                f"loss_orth={loss_orth.detach().item():.4f}, "
-                f"loss_norm={loss_norm.detach().item():.4f}"
+                f"loss_div={loss_div.detach().item():.4f}, "
             )
 
         if return_outputs:
             outputs = {
                 "loss_forget": loss_forget.detach(),
-                "loss_util": loss_util.detach(),
-                "loss_orth": loss_orth.detach(),
-                "loss_norm": loss_norm.detach(),
+                "loss_div": loss_div.detach(),
                 "r_norm": sum(r.detach().norm(p=2) for r in r_ells_list) / len(r_ells_list),
             }
             return loss, outputs
         return loss
-
+    
     def _compute_forget_loss_ga_entropy(self, model, forget_batch, forget_mask):
         """Gradient ascent + entropy regularization on forget samples.
 
@@ -1225,7 +1172,12 @@ class LatentUnlearning(UnlearnTrainer):
                 dtype=model_forget_activations.dtype,
                 device=model_forget_activations.device,
             )
-            control_vec = control_vec.expand_as(model_forget_activations)
+            batch_f, seq_f = model_forget_activations.shape[:2]
+            if control_vec.size(0) > batch_f:
+                control_vec = control_vec[:batch_f]
+            elif control_vec.size(0) < batch_f:
+                control_vec = control_vec.expand(batch_f, -1, -1)
+            control_vec = control_vec.expand(-1, seq_f, -1)
             attract_loss = self._compute_activation_loss(
                 model_forget_activations, control_vec, forget_mask
             )

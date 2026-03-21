@@ -10,12 +10,14 @@ echo "Master Port: $MASTER_PORT"
 
 # Configuration
 MODEL="Llama-3.2-1B-Instruct"
+
 FORGET_SPLIT="forget10"
 RETAIN_SPLIT="retain90"
 HOLDOUT_SPLIT="holdout10"
-TASK_NAME="SimpleNPO_baseline"
+# TASK_NAME="SimpleNPO_baseline"
 MODEL_PATH="open-unlearning/tofu_${MODEL}_full"
-GPUS="0,1"
+TASK_NAME=tofu_${MODEL}_${FORGET_SPLIT}_SimNPO
+GPUS="2,3"
 
 echo "=========================================="
 echo "Running SimNPO baseline test"
