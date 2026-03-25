@@ -23,12 +23,15 @@ export MASTER_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('', 0)
 echo "Master Port: $MASTER_PORT"
 
 MODEL="Llama-3.2-1B-Instruct"
-FORGET_SPLIT="forget01"
-RETAIN_SPLIT="retain99"
-HOLDOUT_SPLIT="holdout01"
+# FORGET_SPLIT="forget01"
+# RETAIN_SPLIT="retain99"
+# HOLDOUT_SPLIT="holdout01"
+FORGET_SPLIT="forget10"
+RETAIN_SPLIT="retain90"
+HOLDOUT_SPLIT="holdout10"
 MODEL_PATH="open-unlearning/tofu_${MODEL}_full"
-TASK_NAME=tofu_${MODEL}_${FORGET_SPLIT}_LatentRMU_v4.7
-GPUS="0"
+TASK_NAME=tofu_${MODEL}_${FORGET_SPLIT}_LatentRMU_v4.8
+GPUS="1"
 
 echo "=========================================="
 echo "Running LatentRMU unlearning"
@@ -55,7 +58,7 @@ CUDA_VISIBLE_DEVICES=$GPUS /data/judy/conda/envs/unlearning/bin/python src/train
     trainer.args.save_strategy=no \
     trainer.method_args.module_regex="model\.layers\.7" \
     trainer.method_args.encoder_epochs=4 \
-    trainer.method_args.steering_coeff=10 \
+    trainer.method_args.steering_coeff=20 \
     trainer.method_args.latent_dim=256 \
     trainer.method_args.orth_weight=2.0 \
     trainer.method_args.retain_sep_weight=2.0 \
