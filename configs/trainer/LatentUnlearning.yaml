@@ -1,0 +1,45 @@
+defaults:
+  - finetune
+
+handler: LatentUnlearning
+
+args: # HuggingFace TrainingArguments
+  learning_rate: 1e-4
+  num_train_epochs: 5
+
+method_args:
+  # Layer intervention (use intervention_layer for single layer, intervention_layers for multi-layer)
+  intervention_layer: 7          # Single layer index ℓ where intervention is applied
+  # intervention_layers: [5, 7, 9]  # Multi-layer intervention (uncomment to use)
+
+  # Loss weights
+  lambda_util: 1.0       # Hyperparameter λ for utility preservation loss
+  mu_orth: 1.0           # Hyperparameter μ for orthogonality loss
+  rho_norm: 0.1          # Hyperparameter ρ for norm regularization loss
+
+  # Steering vector parameters
+  c: 1.0                 # Bounding constant for steering vector (tanh scaling)
+  latent_dim: 256        # Dimension of latent space for DeepSets encoder
+
+  # Pooling options: "mean" (default) or "attention"
+  pooling_type: "mean"
+
+  # Orthogonality constraint options
+  retain_pca_basis: null           # Pre-computed PCA basis U_ℓ for retain set (optional)
+  use_online_pca: false            # Enable online PCA estimation from retain activations
+  online_pca_components: 64        # Number of PCA components to estimate online
+
+  # Two-phase training
+  encoder_epochs: 2                # Number of epochs for Phase 1 (encoder training)
+  phase2_learning_rate: null       # Optional separate learning rate for Phase 2 (defaults to args.learning_rate)
+  steering_coeff: 10.0             # Phase 2: scaling factor for encoder control vector (like RMU)
+  intervention_coeff: 10.0          # Intervention hook: displacement = direction * ||activation|| * coeff
+  forget_warmup_steps: 0           # Phase 2: linearly ramp forget loss weight from 0 to 1 over N steps (0 = disabled)
+  forget_loss_type: "mse"          # Phase 2: "mse" | "ga_entropy" | "retain_swap" | "norm_capped" | "centroid_steer"
+  entropy_weight: 1.0              # Phase 2 (ga_entropy only): weight β for entropy regularization term
+  max_steering_norm: 5.0           # Phase 2 (norm_capped/centroid_steer): max per-token displacement toward target
+  centroid_noise: 0.0              # Phase 2 (centroid_steer): scale of Gaussian noise for diversity (0 = off)
+  repulsion_weight: 0.0            # Phase 2 (centroid_steer): weight for hinge repulsion from ref forget activations (0 = off)
+
+  # Memory optimization
+  kl_last_token_only: true         # Compute utility KL on last token only to reduce memory

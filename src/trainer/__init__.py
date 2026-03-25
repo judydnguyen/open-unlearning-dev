@@ -16,6 +16,11 @@ from trainer.unlearn.satimp import SatImp
 from trainer.unlearn.wga import WGA
 from trainer.unlearn.pdu import PDU
 from trainer.unlearn.lunar import Lunar
+from trainer.unlearn.latent_unlearning import LatentUnlearning
+from trainer.unlearn.reward_unlearn import RewardUnlearn
+from trainer.unlearn.bt_pair_dpo import BTPairDPO
+from trainer.unlearn.SteerGRPO import SteerGRPO
+from trainer.unlearn.rmu_encoder import LatentRMU
 
 
 import logging
@@ -118,3 +123,8 @@ _register_trainer(SatImp)
 _register_trainer(WGA)
 _register_trainer(PDU)
 _register_trainer(Lunar)
+_register_trainer(LatentUnlearning)
+_register_trainer(RewardUnlearn)
+_register_trainer(BTPairDPO)
+_register_trainer(SteerGRPO)
+_register_trainer(LatentRMU)

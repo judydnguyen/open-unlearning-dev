@@ -1,4 +1,5 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from huggingface_hub import snapshot_download
 from omegaconf import DictConfig, open_dict
 from typing import Dict, Any
 import os
@@ -38,6 +39,15 @@ def get_dtype(model_args):
     return torch.float32
 
 
+def _resolve_local_path(model_id: str) -> str:
+    """Resolve a HuggingFace model ID to its local snapshot path, downloading if needed."""
+    if model_id and not os.path.isabs(model_id) and not os.path.exists(model_id):
+        local_path = snapshot_download(repo_id=model_id, cache_dir=hf_home)
+        logger.info(f"Resolved '{model_id}' to local snapshot: {local_path}")
+        return local_path
+    return model_id
+
+
 def get_model(model_cfg: DictConfig):
     assert model_cfg is not None and model_cfg.model_args is not None, ValueError(
         "Model config not found or model_args absent in configs/model."
@@ -49,12 +59,12 @@ def get_model(model_cfg: DictConfig):
     model_cls = MODEL_REGISTRY[model_handler]
     with open_dict(model_args):
         model_path = model_args.pop("pretrained_model_name_or_path", None)
+    model_path = _resolve_local_path(model_path)
     try:
         model = model_cls.from_pretrained(
             pretrained_model_name_or_path=model_path,
             torch_dtype=torch_dtype,
             **model_args,
-            cache_dir=hf_home,
         )
     except Exception as e:
         logger.warning(f"Model {model_path} requested with {model_cfg.model_args}")
@@ -79,13 +89,16 @@ def _add_or_replace_eos_token(tokenizer, eos_token: str) -> None:
 
 
 def get_tokenizer(tokenizer_cfg: DictConfig):
+    with open_dict(tokenizer_cfg):
+        tokenizer_path = tokenizer_cfg.pop("pretrained_model_name_or_path", None)
+    tokenizer_path = _resolve_local_path(tokenizer_path)
     try:
-        tokenizer = AutoTokenizer.from_pretrained(**tokenizer_cfg, cache_dir=hf_home)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_cfg)
     except Exception as e:
         error_message = (
             f"{'--' * 40}\n"
             f"Error {e} fetching tokenizer using AutoTokenizer.\n"
-            f"Tokenizer requested from path: {tokenizer_cfg.get('pretrained_model_name_or_path', None)}\n"
+            f"Tokenizer requested from path: {tokenizer_path}\n"
             f"Full tokenizer config: {tokenizer_cfg}\n"
             f"{'--' * 40}"
         )
