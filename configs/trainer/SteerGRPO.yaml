@@ -12,7 +12,6 @@ method_args:
   hidden_layer: -2
   ga_warmup_steps: 20
   answer_reward_weight: 0.5
-  use_grad_projection: false
   resample_low_var: true
   resample_var_threshold: 0.02
   resample_temp_factor: 1.5
@@ -20,8 +19,6 @@ method_args:
   curriculum: true
   curriculum_ema_alpha: 0.1
   curriculum_softmax_temp: 2.0
-  skip_mastered: false
-  skip_ema_threshold: 0.85
   retain_loss_weight: 0.0
   entropy_beta: 0.0
   log_completions_steps: 10
@@ -30,3 +27,4 @@ method_args:
   lora_alpha: 16
   lora_dropout: 0.05
   lora_target_modules: null
+  kl_beta: 0.0

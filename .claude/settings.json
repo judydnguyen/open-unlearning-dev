@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(CUDA_VISIBLE_DEVICES=4 python:*)"
+      "Bash(CUDA_VISIBLE_DEVICES=4 python:*)",
+      "Bash(kill 2627226)"
     ]
   }
 }

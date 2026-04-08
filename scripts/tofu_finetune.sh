@@ -6,8 +6,9 @@ echo "Master Port: $MASTER_PORT"
 
 models=(
     # "Llama-3.2-1B-Instruct"
-    "Llama-3.2-3B-Instruct"
+    # "Llama-3.2-3B-Instruct"
     # "Llama-3.1-8B-Instruct"
+    "Qwen2.5-7B-Instruct"
 )
 per_device_train_batch_size=4 # Effective batch size 32 on two GPUs with gradent_accumulation_steps=8
 

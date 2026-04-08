@@ -1,19 +1,12 @@
 #!/bin/bash
 
-# Test script for SteerGRPO: GRPO-based unlearning with three reward heads
-# (r_forget, r_naturalness constraint, r_retain)
+# SteerGRPOSimple: minimal two-term GRPO unlearning
+#   reward = (1 - answer_reward_weight) * ref_divergence_norm
+#          +      answer_reward_weight  * (1 - ROUGE1_recall)
+#   + retain_loss_weight * NLL(retain)  — anchors model utility
 #
-# Changes vs v4.3:
-#   - resample_var_threshold raised 0.01 → 0.02 (closer to observed variance floor)
-#   - curriculum_temp renamed to curriculum_softmax_temp
-#   - entropy_beta added (0.02) to encourage output diversity
-#   - learning_rate reduced 1e-4 → 5e-5 (noisy reward curve suggests LR too high)
-#   - PPO clipping now works correctly (old_log_probs fixed in trainer)
-#
-# Changes vs v5.4_forget (disentangle retain/forget objectives):
-#   - retain_loss_weight 0.3 → 0.0 (remove competing gradient; was fighting forget updates)
-#   - naturalness_reward_weight 0.0 → 0.25 (move utility anchoring into reward signal)
-#     reward blend now: ref=0.35, anti_answer=0.6, naturalness=0.25 → renormalised internally
+# Removed vs SteerGRPO:
+#   - offline buffer, curriculum, resampling, naturalness, LoRA
 
 set -e
 
@@ -25,20 +18,19 @@ FORGET_SPLIT="forget01"
 RETAIN_SPLIT="retain99"
 HOLDOUT_SPLIT="holdout01"
 MODEL_PATH="open-unlearning/tofu_${MODEL}_full"
-# MODEL_PATH="/home/judy/code/open-unlearning-dev/saves/sft/tofu_Llama-3.2-1B-Instruct_forget01_coldstart/final"
-TASK_NAME=tofu_${MODEL}_${FORGET_SPLIT}_SteerGRPO_v6.0_lr2e5_rouge
+TASK_NAME=tofu_${MODEL}_${FORGET_SPLIT}_SteerGRPOSimple_v1
 GPUS="2"
 
 echo "=========================================="
-echo "Running SteerGRPO unlearning"
+echo "Running SteerGRPOSimple unlearning"
 echo "Model: $MODEL"
 echo "Task: $TASK_NAME"
 echo "=========================================="
 
-# Step 1: Run Unlearning
+# Step 1: Unlearn
 CUDA_VISIBLE_DEVICES=$GPUS /data/judy/conda/envs/unlearning/bin/python src/train.py --config-name=unlearn.yaml \
     experiment=unlearn/tofu/default \
-    trainer=SteerGRPO \
+    trainer=SteerGRPOSimple \
     task_name=${TASK_NAME} \
     model=${MODEL} \
     forget_split=${FORGET_SPLIT} \
@@ -53,18 +45,12 @@ CUDA_VISIBLE_DEVICES=$GPUS /data/judy/conda/envs/unlearning/bin/python src/train
     trainer.args.eval_strategy=epoch \
     trainer.args.save_strategy=no \
     trainer.method_args.group_size=8 \
-    trainer.method_args.answer_reward_weight=0.6 \
-    trainer.method_args.naturalness_tau=0.5 \
-    trainer.method_args.naturalness_reward_weight=0 \
+    trainer.method_args.answer_reward_weight=0.75 \
+    trainer.method_args.retain_loss_weight=0.5 \
     trainer.method_args.use_lora=true \
     trainer.method_args.lora_r=32 \
-    trainer.method_args.lora_alpha=128 \
-    trainer.method_args.ga_warmup_steps=2 \
-    trainer.method_args.resample_var_threshold=0.02 \
-    trainer.method_args.curriculum_softmax_temp=2.0 \
-    trainer.method_args.entropy_beta=0.02 \
-    trainer.method_args.retain_loss_weight=0.2 \
-    trainer.method_args.kl_beta=0.2 \
+    trainer.method_args.lora_alpha=16 \
+    trainer.method_args.entropy_beta=0.02
 
 echo "=========================================="
 echo "Training completed!"

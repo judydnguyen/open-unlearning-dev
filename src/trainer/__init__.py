@@ -20,6 +20,7 @@ from trainer.unlearn.latent_unlearning import LatentUnlearning
 from trainer.unlearn.reward_unlearn import RewardUnlearn
 from trainer.unlearn.bt_pair_dpo import BTPairDPO
 from trainer.unlearn.SteerGRPO import SteerGRPO
+from trainer.unlearn.SteerGRPOSimple import SteerGRPOSimple
 from trainer.unlearn.rmu_encoder import LatentRMU
 
 
@@ -127,4 +128,5 @@ _register_trainer(LatentUnlearning)
 _register_trainer(RewardUnlearn)
 _register_trainer(BTPairDPO)
 _register_trainer(SteerGRPO)
+_register_trainer(SteerGRPOSimple)
 _register_trainer(LatentRMU)
