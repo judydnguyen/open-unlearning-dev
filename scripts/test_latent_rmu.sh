@@ -122,7 +122,7 @@ RETAIN_SPLIT="retain90"
 HOLDOUT_SPLIT="holdout10"
 MODEL_PATH="open-unlearning/tofu_${MODEL}_full"
 TASK_NAME=tofu_${MODEL}_${FORGET_SPLIT}_LatentRMU_v4.8
-GPUS="1"
+GPUS="0"
 
 echo "=========================================="
 echo "Running LatentRMU unlearning"

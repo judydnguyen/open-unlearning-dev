@@ -1,27 +1,41 @@
 """
-GRPO-based Unlearning Trainer — simplified.
+GRPO-based Unlearning Trainer.
+
+Reward design:
+  - Forgetting signal : 1 - ROUGE-1 recall(completion, gt_answer)
+                        High surface sensitivity → meaningful within-group variance.
+                        ROUGE-1 varies sharply at the token level (e.g. a name
+                        appearing vs not); BERTScore collapses semantically similar
+                        completions to near-identical scores, killing within-group
+                        variance and starving GRPO of signal.
+  - Retain signal     : NLL on retain samples (retain_loss_weight > 0).
+
+Trust region:
+  - PPO clip (epsilon)   : step-to-step stability. Keeps each gradient step within
+                           [1-ε, 1+ε] of the data-collection policy, preventing
+                           jumps to degenerate outputs even when anti-answer reward
+                           is high.
+  - Retain-side KL       : one-sided KL(policy || ref) evaluated ONLY on retain
+                           tokens. Penalises the policy for becoming LESS fluent
+                           than ref on retain content; clamped to zero when the
+                           policy is MORE fluent (a free improvement we don't block).
+                           Completely silent on forget completions — this asymmetry
+                           is the key difference from a naive kl_beta-on-everything
+                           approach, which entangles the two objectives and resists
+                           forgetting while trying to protect retain.
 
 Override reward_fn to customise the forgetting signal:
 
     class MyUnlearner(SteerGRPO):
         def reward_fn(self, prompts, completions, gt_answers=None, **kwargs):
             return [my_score(p, c) for p, c in zip(prompts, completions)]
-
-Default reward blends four signals (weights must sum ≤ 1):
-  ref_reward   = -log_ref(completion | prompt), normalised per-group to [0, 1]
-  anti_answer  = 1 - ROUGE1_recall(completion, gt)
-  naturalness  = cosine(h_policy, h_ref), rescaled to [0, 1]
-  retain       = sigmoid(log_policy(retain) - log_ref(retain)), rescaled to [0, 1]
-                 High when the policy is at least as fluent as ref on retain text.
-                 Broadcast uniformly across the group (all G completions share the
-                 same retain context, so this acts as a per-prompt scalar bonus).
 """
 
 import copy
 import hashlib
-import os
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -38,10 +52,10 @@ except ImportError:
 
 def _seq_log_prob(model, input_ids, attention_mask, labels):
     """Mean log-prob of label tokens per sample. Shape: (B,)"""
-    logits      = model(input_ids=input_ids, attention_mask=attention_mask).logits
-    logits      = logits[:, :-1].contiguous()
-    shift_labs  = labels[:, 1:].contiguous()
-    nll         = F.cross_entropy(
+    logits     = model(input_ids=input_ids, attention_mask=attention_mask).logits
+    logits     = logits[:, :-1].contiguous()
+    shift_labs = labels[:, 1:].contiguous()
+    nll        = F.cross_entropy(
         logits.view(-1, logits.size(-1)),
         shift_labs.view(-1),
         ignore_index=-100,
@@ -49,17 +63,6 @@ def _seq_log_prob(model, input_ids, attention_mask, labels):
     ).view(shift_labs.size())
     mask = (shift_labs != -100).float()
     return -(nll * mask).sum(1) / mask.sum(1).clamp(min=1)
-
-
-def _entropy(model, input_ids, attention_mask, labels):
-    """Mean per-token entropy over completion tokens. Shape: scalar."""
-    logits     = model(input_ids=input_ids, attention_mask=attention_mask).logits
-    logits     = logits[:, :-1].contiguous()
-    shift_labs = labels[:, 1:].contiguous()
-    log_p      = F.log_softmax(logits, dim=-1)
-    token_ent  = -(log_p.exp() * log_p).sum(-1)
-    mask       = (shift_labs != -100).float()
-    return (token_ent * mask).sum() / mask.sum().clamp(min=1)
 
 
 def _grpo_advantages(rewards: torch.Tensor, group_size: int) -> torch.Tensor:
@@ -87,12 +90,12 @@ def _prompt_hash(prompt: str) -> str:
 
 class SteerGRPO(UnlearnTrainer):
     """
-    GRPO unlearning trainer.  Only reward_fn needs to be overridden.
+    GRPO unlearning trainer.
 
-    Reward blend (adjust weights in __init__):
-        reward = ref_w * ref_reward + answer_w * anti_answer + nat_w * naturalness
-
-    All three components are normalised to [0, 1].  Higher = better forgetting.
+    Forgetting signal : 1 - ROUGE-1 recall(completion, gt_answer).
+                        High within-group variance → meaningful GRPO advantages.
+    Retain signal     : NLL loss + one-sided retain-KL trust region.
+                        KL evaluated only on retain tokens — never resists forgetting.
     """
 
     def __init__(
@@ -103,18 +106,12 @@ class SteerGRPO(UnlearnTrainer):
         group_size: int = 4,
         max_new_tokens: int = 64,
         temperature: float = 1.2,
-        epsilon: float = 0.2,           # PPO clip (0 = disabled)
-        entropy_beta: float = 0.02,     # entropy bonus; try 0.01–0.05
-        # Reward weights
-        answer_reward_weight: float = 0.75,
-        naturalness_reward_weight: float = 0.0,
-        retain_reward_weight: float = 0.0,   # 0 = disabled; try 0.1–0.2
-        retain_loss_weight: float = 0.0,     # NLL on retain samples; 0 = disabled
-        kl_beta: float = 0.0,               # KL penalty vs ref on forget completions; 0 = disabled
-        # Retain GRPO stream (low-memory second stream)
-        retain_grpo_weight: float = 0.0,     # 0 = disabled; try 0.1–0.3
-        retain_group_size: int = 2,          # smaller than group_size to save memory
-        hidden_layer: int = -2,         # layer for naturalness cosine similarity
+        epsilon: float = 0.2,          # PPO clip; 0 = disabled
+        # Retain
+        retain_loss_weight: float = 0.1,  # NLL on retain samples
+        retain_kl_beta: float = 0.1,      # one-sided KL on retain tokens vs ref
+                                           # try 0.05–0.2; 0 = disabled
+        kl_beta: Optional[float] = None,   # alias for retain_kl_beta (from config)
         # Resampling degenerate groups
         resample_low_var: bool = True,
         resample_var_threshold: float = 0.02,
@@ -126,8 +123,6 @@ class SteerGRPO(UnlearnTrainer):
         curriculum_softmax_temp: float = 2.0,
         # Logging
         log_completions_steps: int = 10,
-        naturalness_tau: float = 0.8,   # kept for config compat; unused
-        ga_warmup_steps: int = 0,       # kept for config compat; unused
         # LoRA
         use_lora: bool = False,
         lora_r: int = 8,
@@ -138,27 +133,22 @@ class SteerGRPO(UnlearnTrainer):
     ):
         super().__init__(evaluators=evaluators, template_args=template_args, **kwargs)
 
-        self.group_size               = group_size
-        self.max_new_tokens           = max_new_tokens
-        self.temperature              = temperature
-        self.epsilon                  = epsilon
-        self.entropy_beta             = entropy_beta
-        self.answer_reward_weight      = answer_reward_weight
-        self.naturalness_reward_weight = naturalness_reward_weight
-        self.retain_reward_weight      = retain_reward_weight
-        self.retain_loss_weight        = retain_loss_weight
-        self.retain_grpo_weight        = retain_grpo_weight
-        self.retain_group_size         = retain_group_size
-        self.hidden_layer              = hidden_layer
-        self.resample_low_var         = resample_low_var
-        self.resample_var_threshold   = resample_var_threshold
-        self.resample_temp_factor     = resample_temp_factor
-        self.resample_max_tries       = resample_max_tries
-        self.curriculum               = curriculum
-        self.curriculum_ema_alpha     = curriculum_ema_alpha
-        self.curriculum_softmax_temp  = curriculum_softmax_temp
-        self.log_completions_steps    = log_completions_steps
-        self.kl_beta                  = kl_beta
+        self.group_size              = group_size
+        self.max_new_tokens          = max_new_tokens
+        self.temperature             = temperature
+        self.epsilon                 = epsilon
+        self.retain_loss_weight      = retain_loss_weight
+        if kl_beta is not None:
+            retain_kl_beta = kl_beta
+        self.retain_kl_beta          = retain_kl_beta
+        self.resample_low_var        = resample_low_var
+        self.resample_var_threshold  = resample_var_threshold
+        self.resample_temp_factor    = resample_temp_factor
+        self.resample_max_tries      = resample_max_tries
+        self.curriculum              = curriculum
+        self.curriculum_ema_alpha    = curriculum_ema_alpha
+        self.curriculum_softmax_temp = curriculum_softmax_temp
+        self.log_completions_steps   = log_completions_steps
 
         self._prompt_ema: dict = {}
 
@@ -191,165 +181,43 @@ class SteerGRPO(UnlearnTrainer):
             ref = self.accelerator.prepare_model(ref, evaluation_mode=True)
         return ref
 
-    # ── Reward function (override this) ───────────────────────────────────────
+    # ── Reward function (override to customise) ───────────────────────────────
 
+    def _anti_answer(self, completions: List[str], gt_answers: List[str]) -> List[float]:
+        """
+        1 - ROUGE-1 recall(completion, gt_answer).
+
+        Chosen over BERTScore for within-group contrast: ROUGE-1 varies sharply
+        at the surface level (a name either appears or it doesn't), while
+        BERTScore collapses semantically similar outputs to near-identical scores,
+        killing within-group variance and starving GRPO of gradient signal.
+        """
+        return [1.0 - _rouge1_recall(c, gt) for c, gt in zip(completions, gt_answers)]
+    
     def reward_fn(
         self,
         prompts: List[str],
         completions: List[str],
         gt_answers: Optional[List[str]] = None,
-        gen_ids: Optional[torch.Tensor] = None,
-        gen_mask: Optional[torch.Tensor] = None,
-        retain_inputs: Optional[Dict] = None,
         **kwargs,
     ) -> List[float]:
         """
-        Returns List[float] of length B*G.  Higher = better forgetting.
+        Forgetting reward: 1 - ROUGE-1 recall(completion, gt_answer).
 
-        Components:
-          ref_reward  : how surprising the completion is to the ref model.
-                        Per-group min-max normalised so GRPO can contrast
-                        completions within the same prompt.
-          anti_answer : 1 - ROUGE1_recall(completion, ground_truth).
-                        Zero when the model perfectly recites the answer.
-          naturalness : cosine similarity of policy vs ref hidden states,
-                        rescaled from [-1, 1] to [0, 1].
-                        Enable with naturalness_reward_weight > 0.
-          retain      : sigmoid(log_policy(retain) - log_ref(retain)), in [0, 1].
-                        Measures whether the policy is at least as fluent as the
-                        ref model on retain text.  Broadcast uniformly across all
-                        G completions for the same prompt — it is a per-prompt
-                        scalar, not a per-completion one.
-                        Enable with retain_reward_weight > 0.
+        High when the completion does NOT reproduce the correct answer.
+        Returns 0.5 (neutral) when no ground-truth answers are provided.
         """
-        G = self.group_size
-        N = len(completions)
+        if gt_answers is not None:
+            return [1.0 - _rouge1_recall(c, g)
+                    for c, g in zip(completions, gt_answers)]
+        return [0.5] * len(completions)
 
-        # ── ref_reward ────────────────────────────────────────────────────────
-        ref_raw  = self._ref_reward(prompts, completions)
-        r        = torch.tensor(ref_raw, dtype=torch.float32).view(-1, G)
-        r_range  = (r.max(dim=1, keepdim=True).values - r.min(dim=1, keepdim=True).values).clamp(min=1e-8)
-        ref_norm = ((r - r.min(dim=1, keepdim=True).values) / r_range).view(-1).tolist()
-
-        # ── anti_answer ───────────────────────────────────────────────────────
-        if gt_answers is not None and self.answer_reward_weight > 0.0:
-            anti_answer = [1.0 - _rouge1_recall(c, g)
-                           for c, g in zip(completions, gt_answers)]
-        else:
-            anti_answer = [0.5] * N
-
-        # ── naturalness ───────────────────────────────────────────────────────
-        if gen_ids is not None and self.naturalness_reward_weight > 0.0:
-            nat_raw     = self._naturalness(gen_ids, gen_mask)
-            naturalness = [(s + 1.0) / 2.0 for s in nat_raw]
-        else:
-            naturalness = [0.5] * N
-
-        # ── retain reward ─────────────────────────────────────────────────────
-        # Computed once per prompt (B values), then broadcast to B*G.
-        # sigmoid(log_policy - log_ref) ∈ (0, 1):
-        #   > 0.5  → policy is more fluent than ref on retain text  (good)
-        #   < 0.5  → policy has drifted away from retain capability (bad)
-        if retain_inputs is not None and self.retain_reward_weight > 0.0:
-            retain_scores = self._retain_reward(retain_inputs)   # (B,) in [0, 1]
-            retain_reward = [s for s in retain_scores for _ in range(G)]
-        else:
-            retain_reward = [0.5] * N
-
-        # ── blend ─────────────────────────────────────────────────────────────
-        aw = self.answer_reward_weight if gt_answers is not None else 0.0
-        nw = self.naturalness_reward_weight
-        rw_ret = self.retain_reward_weight
-        rw = max(1.0 - aw - nw - rw_ret, 0.0)
-
-        return [
-            rw * rn + aw * aa + nw * ns + rw_ret * ret
-            for rn, aa, ns, ret in zip(ref_norm, anti_answer, naturalness, retain_reward)
-        ]
-
-    # ── Reward components ─────────────────────────────────────────────────────
-
-    def _ref_reward(self, prompts: List[str], completions: List[str]) -> List[float]:
-        """
-        r = -log p_ref(completion | prompt).
-
-        Prompt length is derived from the joint tokenisation to avoid
-        label-mask misalignment when the tokeniser uses special tokens.
-        """
-        pad_id = self._pad_id()
-        device = next(self.ref_model.parameters()).device
-
-        enc = self.tokenizer(
-            [p + c for p, c in zip(prompts, completions)],
-            return_tensors="pt", padding=True, truncation=True, max_length=512,
-        ).to(device)
-
-        prompt_lens = [
-            len(ids) for ids in self.tokenizer(
-                prompts, add_special_tokens=False, padding=False, truncation=True,
-                max_length=512,
-            )["input_ids"]
-        ]
-
-        labels = enc.input_ids.clone()
-        for i, plen in enumerate(prompt_lens):
-            pad_len = (enc.input_ids[i] == pad_id).sum().item()
-            labels[i, : pad_len + plen] = -100
-
-        with torch.no_grad():
-            lp = _seq_log_prob(self.ref_model, enc.input_ids, enc.attention_mask, labels)
-        return (-lp).tolist()
-
-    def _naturalness(
-        self, gen_ids: torch.Tensor, gen_mask: torch.Tensor
-    ) -> List[float]:
-        """
-        Per-sample cosine similarity of mean-pooled hidden states:
-        policy vs ref model.  Range [-1, 1].
-        """
-        def pool(m, ids, mask):
-            h = m(input_ids=ids, attention_mask=mask, output_hidden_states=True
-                  ).hidden_states[self.hidden_layer]
-            w = mask.unsqueeze(-1).float()
-            return (h * w).sum(1) / w.sum(1).clamp(min=1)
-
-        h_pol = pool(self.model, gen_ids, gen_mask)
-        with torch.no_grad():
-            h_ref = pool(self.ref_model, gen_ids, gen_mask)
-        return F.cosine_similarity(h_pol, h_ref, dim=-1).tolist()
-
-    def _retain_reward(self, retain_inputs: Dict) -> List[float]:
-        """
-        Per-sample retain fidelity: sigmoid(log_policy(retain) - log_ref(retain)).
-
-        Returns List[float] of length B, values in (0, 1).
-          > 0.5 → policy is at least as fluent as ref on retain text.
-          < 0.5 → policy has drifted; retain capability is degrading.
-
-        Because all G completions in a group share the same retain context,
-        the score is computed once per prompt and broadcast in reward_fn.
-        """
-        device = next(self.ref_model.parameters()).device
-        ids    = retain_inputs["input_ids"].to(device)
-        mask   = retain_inputs["attention_mask"].to(device)
-        labels = retain_inputs["labels"].to(device)
-
-        policy_model = self.accelerator.unwrap_model(self.model)
-        with torch.no_grad():
-            lp_policy = _seq_log_prob(policy_model, ids, mask, labels)
-            lp_ref    = _seq_log_prob(self.ref_model,  ids, mask, labels)
-
-        # sigmoid maps (−∞, +∞) → (0, 1); 0 diff → 0.5 (neutral)
-        scores = torch.sigmoid(lp_policy - lp_ref)
-        return scores.tolist()
+    # ── Token utilities ───────────────────────────────────────────────────────
 
     def _extract_question_tokens(
         self, forget_inputs: Dict
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Return left-padded (q_ids, q_mask) for the question prefix of each sample
-        (i.e. tokens where labels == -100).
-        """
+        """Left-padded (q_ids, q_mask) for the question prefix of each sample."""
         input_ids = forget_inputs["input_ids"]
         labels    = forget_inputs["labels"]
         B, device = input_ids.size(0), input_ids.device
@@ -396,41 +264,40 @@ class SteerGRPO(UnlearnTrainer):
             mask |= (gen_out == self.tokenizer.eos_token_id).long()
         return mask
 
+    # ── Generation + scoring ──────────────────────────────────────────────────
+
     def _generate_and_score(self, model, forget_inputs):
         """
         1. Extract question tokens, tile by G.
         2. Generate G completions per question.
-        3. Optionally resample low-variance groups (higher temperature).
-        4. Score with reward_fn.
-        5. Capture old_log_probs BEFORE the gradient step (PPO requirement).
+        3. Optionally resample low-variance groups at higher temperature.
+        4. Score with reward_fn (ROUGE-1 anti-answer).
+        5. Capture old_log_probs before the gradient step (PPO requirement).
 
         Returns (gen_ids, gen_mask, comp_labels, rewards, old_log_probs).
         """
-        q_ids, q_mask  = self._extract_question_tokens(forget_inputs)
-        B, max_q       = q_ids.shape
-        G              = self.group_size
-        device         = q_ids.device
-        gen_model      = self.accelerator.unwrap_model(model)
+        q_ids, q_mask = self._extract_question_tokens(forget_inputs)
+        B, max_q      = q_ids.shape
+        G             = self.group_size
+        device        = q_ids.device
+        gen_model     = self.accelerator.unwrap_model(model)
 
         q_ids_rep  = q_ids.repeat_interleave(G, dim=0)
         q_mask_rep = q_mask.repeat_interleave(G, dim=0)
         gen_out    = self._generate(gen_model, q_ids_rep, q_mask_rep, self.temperature)
 
-        gt_unique = self._extract_gt_answers(forget_inputs)
-        gt_rep    = [a for a in gt_unique for _ in range(G)]
-
-        gen_mask_tmp   = self._gen_mask(gen_out)
-        prompts_text   = self.tokenizer.batch_decode(q_ids_rep, skip_special_tokens=True)
-        comps_text     = self.tokenizer.batch_decode(gen_out[:, max_q:], skip_special_tokens=True)
+        gt_unique    = self._extract_gt_answers(forget_inputs)
+        gt_rep       = [a for a in gt_unique for _ in range(G)]
+        prompts_text = self.tokenizer.batch_decode(q_ids_rep, skip_special_tokens=True)
+        comps_text   = self.tokenizer.batch_decode(gen_out[:, max_q:], skip_special_tokens=True)
 
         rewards = torch.tensor(
-            self.reward_fn(prompts_text, comps_text, gt_answers=gt_rep,
-                           gen_ids=gen_out, gen_mask=gen_mask_tmp,
-                           retain_inputs=self._current_retain_inputs),
+            self.reward_fn(prompts_text, comps_text, gt_answers=gt_rep),
             dtype=torch.float32, device=device,
         )
 
-        # Resample groups where all rewards are too similar (collapsed advantages)
+        # Resample groups where all rewards are too similar (collapsed advantages).
+        # Critical for forget01 where the model still answers confidently.
         if self.resample_low_var:
             rw2 = rewards.view(B, G)
             go3 = gen_out.view(B, G, -1)
@@ -447,21 +314,20 @@ class SteerGRPO(UnlearnTrainer):
                 new_p = self.tokenizer.batch_decode(lq_id, skip_special_tokens=True)
                 new_gt = [gt_unique[i] for i in idx.tolist() for _ in range(G)]
                 new_r  = torch.tensor(
-                    self.reward_fn(new_p, new_c, gt_answers=new_gt,
-                                   retain_inputs=self._current_retain_inputs),
+                    self.reward_fn(new_p, new_c, gt_answers=new_gt),
                     dtype=torch.float32, device=device,
                 ).view(-1, G)
 
-                L = go3.size(2)
-                new_g = new_g[:, :L] if new_g.size(1) > L else F.pad(new_g, (0, L - new_g.size(1)), value=self._pad_id())
+                L      = go3.size(2)
+                new_g  = new_g[:, :L] if new_g.size(1) > L else F.pad(new_g, (0, L - new_g.size(1)), value=self._pad_id())
                 new_g3 = new_g.view(-1, G, L)
 
                 improved = False
                 for out_b, src_b in enumerate(idx.tolist()):
                     if new_r[out_b].var(correction=0) > rw2[src_b].var(correction=0):
-                        go3[src_b]  = new_g3[out_b]
-                        rw2[src_b]  = new_r[out_b]
-                        improved    = True
+                        go3[src_b] = new_g3[out_b]
+                        rw2[src_b] = new_r[out_b]
+                        improved   = True
                 if not improved:
                     break
 
@@ -477,81 +343,61 @@ class SteerGRPO(UnlearnTrainer):
 
         return gen_out, gen_mask, comp_labels, rewards, old_log_probs
 
-    def _generate_and_score_retain(self, model, retain_inputs):
-        """
-        Retain GRPO stream.  Generates retain_group_size completions per retain
-        prompt and rewards fluency relative to ref (per-group normalised log-prob).
-
-        Uses a smaller group size than the forget stream so GPU memory stays flat:
-          forget: B * group_size sequences
-          retain: B * retain_group_size sequences  (retain_group_size <= group_size)
-
-        Returns (gen_ids, gen_mask, comp_labels, rewards, old_log_probs) with the
-        same layout as _generate_and_score so _policy_loss can be reused directly.
-        """
-        q_ids, q_mask = self._extract_question_tokens(retain_inputs)
-        B, max_q      = q_ids.shape
-        G             = self.retain_group_size
-        device        = q_ids.device
-        gen_model     = self.accelerator.unwrap_model(model)
-
-        q_ids_rep  = q_ids.repeat_interleave(G, dim=0)
-        q_mask_rep = q_mask.repeat_interleave(G, dim=0)
-        gen_out    = self._generate(gen_model, q_ids_rep, q_mask_rep, self.temperature)
-
-        gen_mask   = self._gen_mask(gen_out)
-        comp_labels = gen_out.clone()
-        comp_labels[:, :max_q] = -100
-
-        # Reward = per-group normalised log-prob (fluency).
-        # Higher reward → more fluent completion → GRPO pushes fluency up.
-        with torch.no_grad():
-            lp = _seq_log_prob(gen_model, gen_out, gen_mask, comp_labels)  # (B*G,)
-
-        lp_view = lp.view(B, G)
-        lp_min  = lp_view.min(dim=1, keepdim=True).values
-        lp_max  = lp_view.max(dim=1, keepdim=True).values
-        rewards  = ((lp_view - lp_min) / (lp_max - lp_min + 1e-8)).view(B * G)
-
-        with torch.no_grad():
-            old_log_probs = lp.detach()
-
-        return gen_out, gen_mask, comp_labels, rewards, old_log_probs
-
     # ── Policy loss ───────────────────────────────────────────────────────────
 
     def _policy_loss(self, model, gen_ids, gen_mask, comp_labels,
-                     advantages, old_log_probs, curriculum_weights,
-                     add_kl: bool = False):
-        """
-        Clipped PPO-style surrogate loss (clip disabled when epsilon == 0).
-        curriculum_weights scale per-sample loss, not advantages.
-        Optional entropy bonus discourages repetitive refusals.
-        Optional KL penalty vs ref model (add_kl=True, uses self.kl_beta).
-        """
+                    advantages, old_log_probs, curriculum_weights):
         log_probs = _seq_log_prob(model, gen_ids, gen_mask, comp_labels)
+        adv = advantages.detach()
 
         if self.epsilon > 0:
-            ratio      = torch.exp(log_probs - old_log_probs.detach())
-            clipped    = ratio.clamp(1 - self.epsilon, 1 + self.epsilon)
-            per_sample = -torch.min(ratio * advantages.detach(),
-                                    clipped * advantages.detach())
+            ratio = torch.exp(log_probs - old_log_probs.detach())
+            lower = torch.ones_like(ratio) * (1 - self.epsilon)
+            per_sample = torch.where(
+                adv >= 0,
+                -ratio * adv,
+                -torch.max(ratio, lower) * adv,
+            )
         else:
-            per_sample = -(log_probs * advantages.detach())
+            per_sample = -(log_probs * adv)
 
-        loss = (per_sample * curriculum_weights.detach()).mean()
+        # Entropy bonus: prevent collapse to empty/refusal completions
+        entropy_bonus = -0.01 * log_probs  # encourage diversity
+        per_sample = per_sample - entropy_bonus
 
-        if self.entropy_beta > 0.0:
-            loss -= self.entropy_beta * _entropy(model, gen_ids, gen_mask, comp_labels)
+        w = curriculum_weights.detach()
+        return (per_sample * w).sum() / w.sum().clamp(min=1e-8)
 
-        if add_kl and self.kl_beta > 0.0:
-            with torch.no_grad():
-                ref_lp = _seq_log_prob(self.ref_model, gen_ids, gen_mask, comp_labels)
-            kl = (log_probs - ref_lp).mean()
-            loss = loss + self.kl_beta * kl.abs()
-            self.log({"grpo/kl": kl.item()})
+    def _retain_kl_loss(self, model, retain_inputs: Dict) -> torch.Tensor:
+        """
+        One-sided retain-side trust region.
 
-        return loss
+        Computes KL(policy || ref) on retain sequences and penalises the policy
+        only when it has drifted AWAY from ref (become less fluent).
+        clamp(min=0) makes this one-sided: the policy is free to become MORE
+        fluent than ref but penalised for becoming less.
+
+        Evaluated on retain tokens only — completely silent on forget completions.
+        This is the asymmetry that separates it from a naive global kl_beta:
+          - permissive on forget  → does not resist the forgetting objective
+          - restrictive on retain → anchors the policy near ref on retain content
+        """
+        pol_lp = _seq_log_prob(
+            model,
+            retain_inputs["input_ids"],
+            retain_inputs["attention_mask"],
+            retain_inputs["labels"],
+        )
+        with torch.no_grad():
+            ref_lp = _seq_log_prob(
+                self.ref_model,
+                retain_inputs["input_ids"],
+                retain_inputs["attention_mask"],
+                retain_inputs["labels"],
+            )
+        # ref_lp - pol_lp > 0  →  policy less fluent than ref  →  penalise
+        # ref_lp - pol_lp < 0  →  policy more fluent than ref  →  free pass
+        return (ref_lp - pol_lp).clamp(min=0).mean()
 
     # ── Curriculum ────────────────────────────────────────────────────────────
 
@@ -580,19 +426,11 @@ class SteerGRPO(UnlearnTrainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         forget_inputs = {k: inputs["forget"][k] for k in ("input_ids", "attention_mask", "labels")}
 
-        # Stash retain inputs so reward_fn can access them during generation.
-        # None when the batch has no retain split or retain_reward_weight == 0.
-        self._current_retain_inputs = (
-            {k: inputs["retain"][k] for k in ("input_ids", "attention_mask", "labels")}
-            if self.retain_reward_weight > 0.0 and "retain" in inputs
-            else None
-        )
-
         gen_ids, gen_mask, comp_labels, rewards, old_log_probs = \
             self._generate_and_score(model, forget_inputs)
 
         q_ids, _ = self._extract_question_tokens(forget_inputs)
-        B, max_q = q_ids.shape
+        B        = q_ids.shape[0]
         G        = self.group_size
 
         advantages = _grpo_advantages(rewards, G)
@@ -605,17 +443,36 @@ class SteerGRPO(UnlearnTrainer):
         else:
             curr_w = torch.ones_like(advantages)
 
-        loss = self._policy_loss(model, gen_ids, gen_mask, comp_labels,
-                                 advantages, old_log_probs, curr_w, add_kl=True)
+        # Forget loss: GRPO policy gradient on forget completions.
+        loss = self._policy_loss(
+            model, gen_ids, gen_mask, comp_labels,
+            advantages, old_log_probs, curr_w,
+        )
 
-        if self.retain_loss_weight > 0.0 and "retain" in inputs:
+        if "retain" in inputs:
             retain_inputs = {k: inputs["retain"][k] for k in ("input_ids", "attention_mask", "labels")}
-            retain_loss = model(**retain_inputs).loss
-            loss = loss + self.retain_loss_weight * retain_loss
-            self.log({"grpo/retain_loss": retain_loss.item()})
 
-        self.log({"grpo/reward_mean": rewards.mean().item(),
-                  "grpo/reward_var":  rewards.var(correction=0).item()})
+            # Retain trust region: one-sided KL(policy || ref) on retain tokens.
+            # Only fires when policy drifts WORSE than ref — does not resist
+            # forgetting when retain quality is fine. Strictly better than NLL
+            # here because NLL unconditionally fights the forget gradient even
+            # when utility hasn't degraded.
+            if self.retain_kl_beta > 0.0:
+                retain_kl   = self._retain_kl_loss(model, retain_inputs)
+                retain_term = self.retain_kl_beta * retain_kl
+                loss        = loss + retain_term
+                # Log the ratio so you can see if one objective is dominating.
+                self.log({
+                    "grpo/retain_kl":    retain_kl.item(),
+                    "grpo/retain_ratio": retain_term.item() / (loss.detach().abs().clamp(min=1e-8)).item(),
+                })
+
+        self.log({
+            "grpo/reward_mean": rewards.mean().item(),
+            "grpo/reward_var":  rewards.var(correction=0).item(),
+        })
+        
+        
         return (loss, None) if return_outputs else loss
 
     # ── Utility ───────────────────────────────────────────────────────────────

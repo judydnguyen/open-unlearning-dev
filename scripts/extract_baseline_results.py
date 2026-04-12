@@ -115,6 +115,21 @@ def collect_forget_generations(eval_json, n=None, max_len=150):
     return result
 
 
+def find_evals_dir(base):
+    """Return the evals dir to use: last checkpoint's evals if present, else top-level evals."""
+    checkpoints = sorted(
+        [d for d in os.listdir(base) if re.match(r"checkpoint-\d+", d)
+         and os.path.isdir(os.path.join(base, d))],
+        key=lambda d: int(d.split("-")[1]),
+    )
+    if checkpoints:
+        last_ckpt = os.path.join(base, checkpoints[-1])
+        ckpt_evals = os.path.join(last_ckpt, "evals")
+        if os.path.isdir(ckpt_evals):
+            return ckpt_evals, checkpoints[-1]
+    return os.path.join(base, "evals"), None
+
+
 def scan_runs(unlearn_dir):
     """Scan directory and return list of run dicts with parsed metadata and paths."""
     runs = []
@@ -122,8 +137,10 @@ def scan_runs(unlearn_dir):
         base = os.path.join(unlearn_dir, name)
         if not os.path.isdir(base):
             continue
-        summary_path = os.path.join(base, "evals", "TOFU_SUMMARY.json")
-        eval_path = os.path.join(base, "evals", "TOFU_EVAL.json")
+
+        evals_dir, checkpoint = find_evals_dir(base)
+        summary_path = os.path.join(evals_dir, "TOFU_SUMMARY.json")
+        eval_path = os.path.join(evals_dir, "TOFU_EVAL.json")
 
         if name.startswith("tofu_"):
             parsed = parse_dir_name(name)
@@ -149,6 +166,7 @@ def scan_runs(unlearn_dir):
             "model": model,
             "split": split,
             "method": method,
+            "checkpoint": checkpoint,
             "summary_path": summary_path,
             "eval_path": eval_path if os.path.exists(eval_path) else None,
         })
@@ -158,17 +176,18 @@ def scan_runs(unlearn_dir):
 def build_metrics_table(runs_group):
     """Markdown metrics table for a group of runs (same model+split)."""
     lines = []
-    header = "| Method | " + " | ".join(SUMMARY_METRICS) + " |"
-    sep = "|---| " + " | ".join("---" for _ in SUMMARY_METRICS) + " |"
+    header = "| Method | Checkpoint | " + " | ".join(SUMMARY_METRICS) + " |"
+    sep = "|---|---| " + " | ".join("---" for _ in SUMMARY_METRICS) + " |"
     lines.append(header)
     lines.append(sep)
     for run in runs_group:
+        ckpt_label = run.get("checkpoint") or "final"
         if run["summary_path"]:
             data = load_json(run["summary_path"])
             vals = " | ".join(fmt(data.get(m)) for m in SUMMARY_METRICS)
         else:
             vals = " | ".join("*(pending)*" for _ in SUMMARY_METRICS)
-        lines.append(f"| {run['method']} | {vals} |")
+        lines.append(f"| {run['method']} | {ckpt_label} | {vals} |")
     return lines
 
 

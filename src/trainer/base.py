@@ -82,6 +82,7 @@ class FinetuneTrainer(Trainer):
     def __init__(self, evaluators=None, template_args=None, *args, **kwargs):
         self.evaluators = evaluators
         self.template_args = template_args
+        self._best_forget_quality = -float("inf")
         super().__init__(*args, **kwargs)
 
     def evaluate(
@@ -113,6 +114,20 @@ class FinetuneTrainer(Trainer):
                         eval_metrics.update(evaluator.evaluate(**eval_args))
                     self.log(eval_metrics)
                     _refresh_metrics_plot(run_dir)
+                    fq = eval_metrics.get("forget_quality")
+                    if fq is not None and fq > self._best_forget_quality:
+                        self._best_forget_quality = fq
+                        best_dir = os.path.join(run_dir, "best")
+                        self.save_model(best_dir)
+                        with open(os.path.join(best_dir, "best_step.json"), "w") as _f:
+                            json.dump({
+                                "step": self.state.global_step,
+                                "forget_quality": fq,
+                            }, _f, indent=2)
+                        logger.info(
+                            "New best forget_quality=%.4f at step %d → saved to %s",
+                            fq, self.state.global_step, best_dir,
+                        )
                 else:
                     logger.warning(
                         "Custom evaluator can be run with this Trainer only when a single accelerator process is running."
