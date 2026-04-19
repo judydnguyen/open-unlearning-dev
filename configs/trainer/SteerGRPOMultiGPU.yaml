@@ -1,7 +1,7 @@
 defaults:
   - finetune
 
-handler: SteerGRPO
+handler: SteerGRPOMultiGPU
 method_args:
   group_size: 4             # G completions sampled per forget question
   max_new_tokens: 64

@@ -7,7 +7,13 @@
       "Bash(echo \"PID: $!\")",
       "Bash(pkill -f \"tofu_Llama-3.2-1B-Instruct_forget05_SteerGRPO_v5.8\")",
       "Bash(awk '{print $1, $2, $11}')",
-      "Bash(bash -n /home/judy/code/open-unlearning-dev/scripts/run_analysis.sh)"
+      "Bash(bash -n /home/judy/code/open-unlearning-dev/scripts/run_analysis.sh)",
+      "Bash(git checkout:*)",
+      "Bash(rm -rf /tank/home/judy/code/open-unlearning-dev/saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget01_SteerGRPO_v5.9)",
+      "Bash(nohup bash:*)",
+      "Bash(kill 2512388)",
+      "Bash(pkill -f \"SteerGRPO_v6.0\")",
+      "Bash(SKIP_EVAL=1 bash scripts/test_steer_grpo_7b.sh)"
     ]
   }
 }

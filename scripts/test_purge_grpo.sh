@@ -1,26 +1,20 @@
 #!/bin/bash
 
-# SteerGRPO on forget05 — v6.0
+# PurgeGRPO on TOFU — v1.0
 #
-# v5.9 post-mortem: forget_quality stuck at 0.0068 for all 10 epochs.
-# Root cause: kl_beta=0.2 uses kl.abs() — bidirectional KL penalty that
-# prevented the policy from diverging from ref in EITHER direction, killing
-# the forgetting signal entirely.
+# PURGE baseline: GRPO with binary forget-word reward.
+# Reward = 1.0 if completion contains none of the forget-set words (auto-extracted
+# from forget dataset answer labels), 0.0 otherwise.
 #
-# v6.0 returns to the parameter set from the successful v5.7_repro run
-# (forget_quality=0.5894, model_utility=0.5263 @ checkpoint-200):
-#   - kl_beta removed (was blocking forgetting)
-#   - retain_loss_weight=0.2  (v5.7 value; keeps utility via NLL on retain)
-#   - answer_reward_weight=0.6  (v5.7 value; explicit to avoid default drift)
-#   - entropy_beta=0.02        (v5.7 value; generation diversity bonus)
-#   - lora_r=64, lora_alpha=128  (v5.7 value)
-#   - naturalness_reward_weight=0  (disabled, not in v5.7)
-#   - ga_warmup_steps=2  (v5.7 value)
-#   - num_train_epochs=20  (v5.7 value; best ckpt was at step 200/~270 total)
-#
-# New vs v5.7_repro:
-#   - save-best logic active (saves best forget_quality checkpoint)
-#   - GPUS=3
+# Starting hyperparameters mirror the SteerGRPO v5.7 setting that worked well
+# (forget_quality ~0.59 on forget05) with the auxiliary reward terms zeroed out:
+#   - answer_reward_weight=0  (PURGE uses word-list reward, not ROUGE anti-answer)
+#   - naturalness_reward_weight=0
+#   - kl_beta=0
+#   - retain_loss_weight=0.2   (NLL on retain keeps utility from collapsing)
+#   - use_lora=true, lora_r=64 (memory-efficient; merge on save)
+#   - curriculum=false          (faithful PURGE baseline)
+#   - entropy_beta=0.0          (no extra diversity signal)
 
 set -e
 
@@ -28,25 +22,29 @@ export MASTER_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('', 0)
 echo "Master Port: $MASTER_PORT"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HF_HOME=/data/judy/huggingface
 
 MODEL="Llama-3.2-1B-Instruct"
 FORGET_SPLIT="forget05"
 RETAIN_SPLIT="retain95"
 HOLDOUT_SPLIT="holdout05"
 MODEL_PATH="open-unlearning/tofu_${MODEL}_full"
-TASK_NAME=tofu_${MODEL}_${FORGET_SPLIT}_SteerGRPO_v6.0
+TASK_NAME=tofu_${MODEL}_${FORGET_SPLIT}_PurgeGRPO_v1.0
 GPUS="3"
 
 echo "=========================================="
-echo "Running SteerGRPO unlearning (forget05) v6.0"
-echo "Model: $MODEL"
-echo "Task: $TASK_NAME"
+echo "Running PurgeGRPO unlearning (forget05) v1.0"
+echo "Model:  $MODEL"
+echo "Split:  $FORGET_SPLIT / $RETAIN_SPLIT"
+echo "Task:   $TASK_NAME"
+echo "GPU(s): $GPUS"
 echo "=========================================="
 
-# Step 1: Run Unlearning
-CUDA_VISIBLE_DEVICES=$GPUS /data/judy/conda/envs/unlearning/bin/python src/train.py --config-name=unlearn.yaml \
+# Step 1: Unlearning
+CUDA_VISIBLE_DEVICES=$GPUS /data/judy/conda/envs/unlearning/bin/python src/train.py \
+    --config-name=unlearn.yaml \
     experiment=unlearn/tofu/default \
-    trainer=SteerGRPO \
+    trainer=PurgeGRPO \
     task_name=${TASK_NAME} \
     model=${MODEL} \
     forget_split=${FORGET_SPLIT} \
@@ -61,23 +59,22 @@ CUDA_VISIBLE_DEVICES=$GPUS /data/judy/conda/envs/unlearning/bin/python src/train
     trainer.args.eval_strategy=epoch \
     trainer.args.save_strategy=no \
     trainer.method_args.group_size=8 \
-    trainer.method_args.answer_reward_weight=0.6 \
-    trainer.method_args.naturalness_reward_weight=0 \
+    trainer.method_args.max_new_tokens=64 \
+    trainer.method_args.temperature=1.0 \
+    trainer.method_args.epsilon=0.2 \
     trainer.method_args.use_lora=true \
     trainer.method_args.lora_r=64 \
     trainer.method_args.lora_alpha=128 \
-    trainer.method_args.ga_warmup_steps=2 \
-    trainer.method_args.resample_var_threshold=0.02 \
-    trainer.method_args.curriculum_softmax_temp=2.0 \
-    trainer.method_args.entropy_beta=0.02 \
-    trainer.method_args.retain_loss_weight=0.4
+    trainer.method_args.retain_loss_weight=0.2 \
+    trainer.method_args.resample_low_var=true \
+    trainer.method_args.resample_var_threshold=0.02
 
 echo "=========================================="
 echo "Training completed!"
 echo "Results saved to: saves/unlearn/${TASK_NAME}"
 echo "=========================================="
 
-# Step 2: Evaluate — prefer best/ checkpoint if save-best produced one
+# Step 2: Evaluate — use best/ checkpoint if save-best produced one
 EVAL_CKPT=saves/unlearn/${TASK_NAME}
 if [ -f "saves/unlearn/${TASK_NAME}/best/best_step.json" ]; then
     EVAL_CKPT=saves/unlearn/${TASK_NAME}/best

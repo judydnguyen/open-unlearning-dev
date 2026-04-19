@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# SteerGRPO on forget05 — v6.0
+# SteerGRPO on forget01 — v6.0
 #
 # v5.9 post-mortem: forget_quality stuck at 0.0068 for all 10 epochs.
 # Root cause: kl_beta=0.2 uses kl.abs() — bidirectional KL penalty that
@@ -30,15 +30,15 @@ echo "Master Port: $MASTER_PORT"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 MODEL="Llama-3.2-1B-Instruct"
-FORGET_SPLIT="forget05"
-RETAIN_SPLIT="retain95"
-HOLDOUT_SPLIT="holdout05"
+FORGET_SPLIT="forget01"
+RETAIN_SPLIT="retain99"
+HOLDOUT_SPLIT="holdout01"
 MODEL_PATH="open-unlearning/tofu_${MODEL}_full"
 TASK_NAME=tofu_${MODEL}_${FORGET_SPLIT}_SteerGRPO_v6.0
-GPUS="3"
+GPUS="1"
 
 echo "=========================================="
-echo "Running SteerGRPO unlearning (forget05) v6.0"
+echo "Running SteerGRPO unlearning (forget01) v6.0"
 echo "Model: $MODEL"
 echo "Task: $TASK_NAME"
 echo "=========================================="
@@ -55,7 +55,7 @@ CUDA_VISIBLE_DEVICES=$GPUS /data/judy/conda/envs/unlearning/bin/python src/train
     retain_logs_path=saves/eval/tofu_${MODEL}_${RETAIN_SPLIT}/TOFU_EVAL.json \
     trainer.args.per_device_train_batch_size=4 \
     trainer.args.gradient_accumulation_steps=1 \
-    trainer.args.num_train_epochs=10 \
+    trainer.args.num_train_epochs=20 \
     trainer.args.learning_rate=1e-4 \
     trainer.args.logging_steps=10 \
     trainer.args.eval_strategy=epoch \
@@ -70,32 +70,51 @@ CUDA_VISIBLE_DEVICES=$GPUS /data/judy/conda/envs/unlearning/bin/python src/train
     trainer.method_args.resample_var_threshold=0.02 \
     trainer.method_args.curriculum_softmax_temp=2.0 \
     trainer.method_args.entropy_beta=0.02 \
-    trainer.method_args.retain_loss_weight=0.4
+    trainer.method_args.retain_loss_weight=0.3
 
 echo "=========================================="
 echo "Training completed!"
 echo "Results saved to: saves/unlearn/${TASK_NAME}"
 echo "=========================================="
 
-# Step 2: Evaluate — prefer best/ checkpoint if save-best produced one
-EVAL_CKPT=saves/unlearn/${TASK_NAME}
+# Step 2: Evaluate best/ checkpoint if save-best produced one
 if [ -f "saves/unlearn/${TASK_NAME}/best/best_step.json" ]; then
-    EVAL_CKPT=saves/unlearn/${TASK_NAME}/best
-    echo "Using best checkpoint: $(cat saves/unlearn/${TASK_NAME}/best/best_step.json)"
+    BEST_CKPT=saves/unlearn/${TASK_NAME}/best
+    echo "Evaluating best checkpoint: $(cat saves/unlearn/${TASK_NAME}/best/best_step.json)"
+    CUDA_VISIBLE_DEVICES=${GPUS%%,*} /data/judy/conda/envs/unlearning/bin/python src/eval.py \
+        --config-name=eval.yaml \
+        experiment=eval/tofu/default \
+        forget_split=${FORGET_SPLIT} \
+        holdout_split=${HOLDOUT_SPLIT} \
+        model=${MODEL} \
+        task_name=${TASK_NAME} \
+        model.model_args.pretrained_model_name_or_path=${BEST_CKPT} \
+        model.tokenizer_args.pretrained_model_name_or_path=${BEST_CKPT} \
+        paths.output_dir=${BEST_CKPT}/evals \
+        retain_logs_path=saves/eval/tofu_${MODEL}_${RETAIN_SPLIT}/TOFU_EVAL.json
+    echo "Best evals: ${BEST_CKPT}/evals"
 fi
 
-CUDA_VISIBLE_DEVICES=${GPUS%%,*} /data/judy/conda/envs/unlearning/bin/python src/eval.py \
-    --config-name=eval.yaml \
-    experiment=eval/tofu/default \
-    forget_split=${FORGET_SPLIT} \
-    holdout_split=${HOLDOUT_SPLIT} \
-    model=${MODEL} \
-    task_name=${TASK_NAME} \
-    model.model_args.pretrained_model_name_or_path=${EVAL_CKPT} \
-    model.tokenizer_args.pretrained_model_name_or_path=${EVAL_CKPT} \
-    paths.output_dir=${EVAL_CKPT}/evals \
-    retain_logs_path=saves/eval/tofu_${MODEL}_${RETAIN_SPLIT}/TOFU_EVAL.json
+# Step 3: Evaluate last/ checkpoint (always)
+LAST_CKPT=saves/unlearn/${TASK_NAME}/last
+if [ -f "${LAST_CKPT}/last_step.json" ]; then
+    echo "Evaluating last checkpoint: $(cat ${LAST_CKPT}/last_step.json)"
+    CUDA_VISIBLE_DEVICES=${GPUS%%,*} /data/judy/conda/envs/unlearning/bin/python src/eval.py \
+        --config-name=eval.yaml \
+        experiment=eval/tofu/default \
+        forget_split=${FORGET_SPLIT} \
+        holdout_split=${HOLDOUT_SPLIT} \
+        model=${MODEL} \
+        task_name=${TASK_NAME} \
+        model.model_args.pretrained_model_name_or_path=${LAST_CKPT} \
+        model.tokenizer_args.pretrained_model_name_or_path=${LAST_CKPT} \
+        paths.output_dir=${LAST_CKPT}/evals \
+        retain_logs_path=saves/eval/tofu_${MODEL}_${RETAIN_SPLIT}/TOFU_EVAL.json
+    echo "Last evals: ${LAST_CKPT}/evals"
+else
+    echo "WARNING: ${LAST_CKPT}/last_step.json not found — skipping last eval"
+fi
 
 echo "=========================================="
-echo "Done. Results: ${EVAL_CKPT}/evals"
+echo "Done."
 echo "=========================================="

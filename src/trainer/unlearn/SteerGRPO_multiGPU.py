@@ -85,9 +85,11 @@ def _prompt_hash(prompt: str) -> str:
 
 # ── Trainer ───────────────────────────────────────────────────────────────────
 
-class SteerGRPO(UnlearnTrainer):
+class SteerGRPOMultiGPU(UnlearnTrainer):
     """
-    GRPO unlearning trainer.  Only reward_fn needs to be overridden.
+    GRPO unlearning trainer — split-GPU variant.
+    Policy model on cuda:0 (with gradients), ref model on cuda:1 (fp16, frozen).
+    Only reward_fn needs to be overridden.
 
     Reward blend (adjust weights in __init__):
         reward = ref_w * ref_reward + answer_w * anti_answer + nat_w * naturalness
@@ -138,6 +140,9 @@ class SteerGRPO(UnlearnTrainer):
     ):
         super().__init__(evaluators=evaluators, template_args=template_args, **kwargs)
 
+        self.policy_device = torch.device("cuda:0")
+        self.ref_device    = torch.device("cuda:1")
+
         self.group_size               = group_size
         self.max_new_tokens           = max_new_tokens
         self.temperature              = temperature
@@ -162,6 +167,8 @@ class SteerGRPO(UnlearnTrainer):
 
         self._prompt_ema: dict = {}
 
+        self.model.to(self.policy_device)
+
         if not hasattr(self, "ref_model") or self.ref_model is None:
             self.ref_model = self._make_ref_model(self.model)
 
@@ -180,15 +187,38 @@ class SteerGRPO(UnlearnTrainer):
                 ),
             )
 
+        # Gradient checkpointing with use_reentrant=True (PyTorch default) requires
+        # at least one input tensor to have requires_grad=True.  Our inputs are all
+        # integer token IDs, so we force non-reentrant mode which has no such
+        # restriction.  We patch the method so HF Trainer's later call picks it up.
+        _orig_gc_enable = self.model.gradient_checkpointing_enable
+        def _gc_enable_non_reentrant(**kwargs):
+            if not kwargs.get("gradient_checkpointing_kwargs"):
+                kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+            else:
+                kwargs["gradient_checkpointing_kwargs"].setdefault("use_reentrant", False)
+            return _orig_gc_enable(**kwargs)
+        self.model.gradient_checkpointing_enable = _gc_enable_non_reentrant
+
+        # Fix: gradient checkpointing must be enabled explicitly here when
+        # _wrap_model skips the normal HF Trainer wrapping path.
+        # use_reentrant=False avoids "does not require grad" errors that
+        # reentrant checkpointing causes with custom loss functions.
+        if self.args.gradient_checkpointing:
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+
     # ── Reference model ───────────────────────────────────────────────────────
 
     def _make_ref_model(self, model):
-        ref = copy.deepcopy(model).to(self.accelerator.device)
+        # Deepcopy on CPU to avoid doubling GPU 0 peak allocation, then
+        # cast to fp16 and place on the ref device.
+        model.to("cpu")
+        ref = copy.deepcopy(model).to(torch.float16).to(self.ref_device)
+        model.to(self.policy_device)
         ref.eval()
-        if self.is_deepspeed_enabled:
-            ref = self._prepare_deepspeed(ref)
-        else:
-            ref = self.accelerator.prepare_model(ref, evaluation_mode=True)
+        ref.requires_grad_(False)
         return ref
 
     # ── Reward function (override this) ───────────────────────────────────────
@@ -277,12 +307,11 @@ class SteerGRPO(UnlearnTrainer):
         label-mask misalignment when the tokeniser uses special tokens.
         """
         pad_id = self._pad_id()
-        device = next(self.ref_model.parameters()).device
 
         enc = self.tokenizer(
             [p + c for p, c in zip(prompts, completions)],
             return_tensors="pt", padding=True, truncation=True, max_length=512,
-        ).to(device)
+        ).to(self.ref_device)
 
         prompt_lens = [
             len(ids) for ids in self.tokenizer(
@@ -298,7 +327,7 @@ class SteerGRPO(UnlearnTrainer):
 
         with torch.no_grad():
             lp = _seq_log_prob(self.ref_model, enc.input_ids, enc.attention_mask, labels)
-        return (-lp).tolist()
+        return (-lp).to("cpu").tolist()
 
     def _naturalness(
         self, gen_ids: torch.Tensor, gen_mask: torch.Tensor
@@ -306,16 +335,21 @@ class SteerGRPO(UnlearnTrainer):
         """
         Per-sample cosine similarity of mean-pooled hidden states:
         policy vs ref model.  Range [-1, 1].
+
+        Fix: both policy and ref pooling run under torch.no_grad() because
+        rewards are always detached scalars — tracking grad here wastes memory
+        and can cause device/context mismatches downstream.
         """
         def pool(m, ids, mask):
-            h = m(input_ids=ids, attention_mask=mask, output_hidden_states=True
-                  ).hidden_states[self.hidden_layer]
+            with torch.no_grad():
+                h = m(input_ids=ids, attention_mask=mask, output_hidden_states=True
+                      ).hidden_states[self.hidden_layer]
             w = mask.unsqueeze(-1).float()
             return (h * w).sum(1) / w.sum(1).clamp(min=1)
 
-        h_pol = pool(self.model, gen_ids, gen_mask)
-        with torch.no_grad():
-            h_ref = pool(self.ref_model, gen_ids, gen_mask)
+        h_pol = pool(self.model,     gen_ids.to(self.policy_device), gen_mask.to(self.policy_device))
+        h_ref = pool(self.ref_model, gen_ids.to(self.ref_device),    gen_mask.to(self.ref_device))
+        h_ref = h_ref.to(self.policy_device).float()
         return F.cosine_similarity(h_pol, h_ref, dim=-1).tolist()
 
     def _retain_reward(self, retain_inputs: Dict) -> List[float]:
@@ -329,18 +363,21 @@ class SteerGRPO(UnlearnTrainer):
         Because all G completions in a group share the same retain context,
         the score is computed once per prompt and broadcast in reward_fn.
         """
-        device = next(self.ref_model.parameters()).device
-        ids    = retain_inputs["input_ids"].to(device)
-        mask   = retain_inputs["attention_mask"].to(device)
-        labels = retain_inputs["labels"].to(device)
+        ids_ref    = retain_inputs["input_ids"].to(self.ref_device)
+        mask_ref   = retain_inputs["attention_mask"].to(self.ref_device)
+        labels_ref = retain_inputs["labels"].to(self.ref_device)
+
+        ids_pol    = retain_inputs["input_ids"].to(self.policy_device)
+        mask_pol   = retain_inputs["attention_mask"].to(self.policy_device)
+        labels_pol = retain_inputs["labels"].to(self.policy_device)
 
         policy_model = self.accelerator.unwrap_model(self.model)
         with torch.no_grad():
-            lp_policy = _seq_log_prob(policy_model, ids, mask, labels)
-            lp_ref    = _seq_log_prob(self.ref_model,  ids, mask, labels)
+            lp_policy = _seq_log_prob(policy_model,   ids_pol, mask_pol, labels_pol)
+            lp_ref    = _seq_log_prob(self.ref_model, ids_ref, mask_ref, labels_ref)
 
         # sigmoid maps (−∞, +∞) → (0, 1); 0 diff → 0.5 (neutral)
-        scores = torch.sigmoid(lp_policy - lp_ref)
+        scores = torch.sigmoid(lp_policy - lp_ref.to(self.policy_device))
         return scores.tolist()
 
     def _extract_question_tokens(
@@ -407,9 +444,11 @@ class SteerGRPO(UnlearnTrainer):
         Returns (gen_ids, gen_mask, comp_labels, rewards, old_log_probs).
         """
         q_ids, q_mask  = self._extract_question_tokens(forget_inputs)
+        q_ids  = q_ids.to(self.policy_device)
+        q_mask = q_mask.to(self.policy_device)
         B, max_q       = q_ids.shape
         G              = self.group_size
-        device         = q_ids.device
+        device         = self.policy_device
         gen_model      = self.accelerator.unwrap_model(model)
 
         q_ids_rep  = q_ids.repeat_interleave(G, dim=0)
@@ -427,7 +466,7 @@ class SteerGRPO(UnlearnTrainer):
             self.reward_fn(prompts_text, comps_text, gt_answers=gt_rep,
                            gen_ids=gen_out, gen_mask=gen_mask_tmp,
                            retain_inputs=self._current_retain_inputs),
-            dtype=torch.float32, device=device,
+            dtype=torch.float32, device=self.policy_device,
         )
 
         # Resample groups where all rewards are too similar (collapsed advantages)
@@ -449,7 +488,7 @@ class SteerGRPO(UnlearnTrainer):
                 new_r  = torch.tensor(
                     self.reward_fn(new_p, new_c, gt_answers=new_gt,
                                    retain_inputs=self._current_retain_inputs),
-                    dtype=torch.float32, device=device,
+                    dtype=torch.float32, device=self.policy_device,
                 ).view(-1, G)
 
                 L = go3.size(2)
@@ -468,6 +507,9 @@ class SteerGRPO(UnlearnTrainer):
             gen_out = go3.view(B * G, -1)
             rewards = rw2.view(B * G)
 
+        # Fix: explicitly move to policy_device after resampling loop, since
+        # F.pad can produce CPU tensors when the input view loses its device context.
+        gen_out     = gen_out.to(self.policy_device)
         gen_mask    = self._gen_mask(gen_out)
         comp_labels = gen_out.clone()
         comp_labels[:, :max_q] = -100
@@ -490,9 +532,10 @@ class SteerGRPO(UnlearnTrainer):
         same layout as _generate_and_score so _policy_loss can be reused directly.
         """
         q_ids, q_mask = self._extract_question_tokens(retain_inputs)
+        q_ids  = q_ids.to(self.policy_device)
+        q_mask = q_mask.to(self.policy_device)
         B, max_q      = q_ids.shape
         G             = self.retain_group_size
-        device        = q_ids.device
         gen_model     = self.accelerator.unwrap_model(model)
 
         q_ids_rep  = q_ids.repeat_interleave(G, dim=0)
@@ -528,14 +571,19 @@ class SteerGRPO(UnlearnTrainer):
         curriculum_weights scale per-sample loss, not advantages.
         Optional entropy bonus discourages repetitive refusals.
         Optional KL penalty vs ref model (add_kl=True, uses self.kl_beta).
+
+        Fix: torch.minimum (element-wise) instead of torch.min (reduction),
+        which was silently dropping grad_fn in some PyTorch versions.
         """
         log_probs = _seq_log_prob(model, gen_ids, gen_mask, comp_labels)
+        assert log_probs.requires_grad, "log_probs has no grad — check model mode and gradient_checkpointing config"
 
         if self.epsilon > 0:
             ratio      = torch.exp(log_probs - old_log_probs.detach())
-            clipped    = ratio.clamp(1 - self.epsilon, 1 + self.epsilon)
-            per_sample = -torch.min(ratio * advantages.detach(),
-                                    clipped * advantages.detach())
+            clipped    = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon)
+            adv        = advantages.detach()
+            # Fix: torch.minimum preserves grad_fn; torch.min(a, b) does not reliably.
+            per_sample = -torch.minimum(ratio * adv, clipped * adv)
         else:
             per_sample = -(log_probs * advantages.detach())
 
@@ -546,7 +594,11 @@ class SteerGRPO(UnlearnTrainer):
 
         if add_kl and self.kl_beta > 0.0:
             with torch.no_grad():
-                ref_lp = _seq_log_prob(self.ref_model, gen_ids, gen_mask, comp_labels)
+                ref_ids  = gen_ids.to(self.ref_device)
+                ref_mask = gen_mask.to(self.ref_device)
+                ref_labs = comp_labels.to(self.ref_device)
+                ref_lp   = _seq_log_prob(self.ref_model, ref_ids, ref_mask, ref_labs)
+                ref_lp   = ref_lp.to(self.policy_device)
             kl = (log_probs - ref_lp).mean()
             loss = loss + self.kl_beta * kl.abs()
             self.log({"grpo/kl": kl.item()})
@@ -578,7 +630,7 @@ class SteerGRPO(UnlearnTrainer):
     # ── Main loss ─────────────────────────────────────────────────────────────
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        forget_inputs = {k: inputs["forget"][k] for k in ("input_ids", "attention_mask", "labels")}
+        forget_inputs = {k: inputs["forget"][k].to(self.policy_device) for k in ("input_ids", "attention_mask", "labels")}
 
         # Stash retain inputs so reward_fn can access them during generation.
         # None when the batch has no retain split or retain_reward_weight == 0.
@@ -600,6 +652,9 @@ class SteerGRPO(UnlearnTrainer):
         if self.curriculum:
             prompts_unique = self.tokenizer.batch_decode(q_ids, skip_special_tokens=True)
             curr_w         = self._curriculum_weights(prompts_unique, rewards)
+            # Fix: explicitly move to policy_device — _curriculum_weights builds
+            # the tensor on rewards.device which may differ after the EMA update path.
+            curr_w         = curr_w.to(self.policy_device)
             collapsed      = (rewards.view(B, G).var(dim=1, correction=0) < self.resample_var_threshold)
             curr_w[collapsed.repeat_interleave(G)] = 0.0
         else:
@@ -609,14 +664,29 @@ class SteerGRPO(UnlearnTrainer):
                                  advantages, old_log_probs, curr_w, add_kl=True)
 
         if self.retain_loss_weight > 0.0 and "retain" in inputs:
-            retain_inputs = {k: inputs["retain"][k] for k in ("input_ids", "attention_mask", "labels")}
-            retain_loss = model(**retain_inputs).loss
+            retain_inputs = {k: inputs["retain"][k].to(self.policy_device) for k in ("input_ids", "attention_mask", "labels")}
+            # Use unwrapped model to avoid DataParallel splitting the loss across GPUs.
+            policy_model = self.accelerator.unwrap_model(model)
+            retain_loss = policy_model(**retain_inputs).loss
             loss = loss + self.retain_loss_weight * retain_loss
             self.log({"grpo/retain_loss": retain_loss.item()})
 
         self.log({"grpo/reward_mean": rewards.mean().item(),
                   "grpo/reward_var":  rewards.var(correction=0).item()})
         return (loss, None) if return_outputs else loss
+
+    # ── HF Trainer hooks ─────────────────────────────────────────────────────
+
+    def _wrap_model(self, model, training=True, dataloader=None):
+        """
+        Skip DataParallel wrapping entirely.
+
+        HF Trainer wraps in nn.DataParallel when torch.cuda.device_count() > 1,
+        but DataParallel is incompatible with gradient_checkpointing and breaks
+        our manual device split (policy on cuda:0, ref on cuda:1).
+        We manage placement ourselves, so no wrapping is needed.
+        """
+        return model
 
     # ── Utility ───────────────────────────────────────────────────────────────
 
@@ -635,3 +705,4 @@ class SteerGRPO(UnlearnTrainer):
                 self.tokenizer.save_pretrained(output_dir)
         else:
             super().save_model(output_dir, _internal_call=_internal_call)
+

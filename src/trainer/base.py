@@ -6,6 +6,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import logging
 from transformers import Trainer
 from torch.utils.data import Dataset
@@ -83,6 +84,7 @@ class FinetuneTrainer(Trainer):
         self.evaluators = evaluators
         self.template_args = template_args
         self._best_forget_quality = -float("inf")
+        self._custom_eval_skipped_warned = False
         super().__init__(*args, **kwargs)
 
     def evaluate(
@@ -94,43 +96,54 @@ class FinetuneTrainer(Trainer):
     ) -> Dict[str, float]:
         # Run a custom evaluator and save results
         if self.evaluators:
-            if self.accelerator.is_local_main_process:
-                eval_metrics = {}
-                if self.accelerator.num_processes == 1:
-                    run_dir = self._get_output_dir(trial=trial)
-                    checkpoint_folder = (
-                        f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
-                    )
-                    output_dir = os.path.join(run_dir, checkpoint_folder, "evals")
-                    os.makedirs(output_dir, exist_ok=True)
-                    eval_metrics = {}
-                    for _, evaluator in self.evaluators.items():
-                        eval_args = {
-                            "output_dir": output_dir,
-                            "template_args": self.template_args,
-                            "model": self.model,
-                            "tokenizer": self.tokenizer,
-                        }
-                        eval_metrics.update(evaluator.evaluate(**eval_args))
-                    self.log(eval_metrics)
-                    _refresh_metrics_plot(run_dir)
-                    fq = eval_metrics.get("forget_quality")
-                    if fq is not None and fq > self._best_forget_quality:
-                        self._best_forget_quality = fq
-                        best_dir = os.path.join(run_dir, "best")
-                        self.save_model(best_dir)
-                        with open(os.path.join(best_dir, "best_step.json"), "w") as _f:
-                            json.dump({
-                                "step": self.state.global_step,
-                                "forget_quality": fq,
-                            }, _f, indent=2)
-                        logger.info(
-                            "New best forget_quality=%.4f at step %d → saved to %s",
-                            fq, self.state.global_step, best_dir,
-                        )
-                else:
+            if self.accelerator.num_processes > 1:
+                if not self._custom_eval_skipped_warned:
                     logger.warning(
-                        "Custom evaluator can be run with this Trainer only when a single accelerator process is running."
+                        "Custom evaluator requires a single accelerator process; "
+                        "skipping in-training eval (num_processes=%d). "
+                        "Run src/eval.py after training for full metrics.",
+                        self.accelerator.num_processes,
+                    )
+                    self._custom_eval_skipped_warned = True
+                return {}
+            if self.accelerator.is_local_main_process:
+                run_dir = self._get_output_dir(trial=trial)
+                checkpoint_folder = (
+                    f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+                )
+                output_dir = os.path.join(run_dir, checkpoint_folder, "evals")
+                os.makedirs(output_dir, exist_ok=True)
+                eval_metrics = {}
+                for _, evaluator in self.evaluators.items():
+                    eval_args = {
+                        "output_dir": output_dir,
+                        "template_args": self.template_args,
+                        "model": self.model,
+                        "tokenizer": self.tokenizer,
+                    }
+                    eval_metrics.update(evaluator.evaluate(**eval_args))
+                self.log(eval_metrics)
+                _refresh_metrics_plot(run_dir)
+                mu = eval_metrics.get("model_utility")
+                ner = eval_metrics.get("forget_Q_A_NER")
+                if mu is not None and ner is not None:
+                    joint_score = (mu + (1.0 - ner)) / 2.0
+                else:
+                    joint_score = None
+                if joint_score is not None and joint_score > self._best_forget_quality:
+                    self._best_forget_quality = joint_score
+                    best_dir = os.path.join(run_dir, "best")
+                    self.save_model(best_dir)
+                    with open(os.path.join(best_dir, "best_step.json"), "w") as _f:
+                        json.dump({
+                            "step": self.state.global_step,
+                            "model_utility": mu,
+                            "forget_Q_A_NER": ner,
+                            "joint_score": joint_score,
+                        }, _f, indent=2)
+                    logger.info(
+                        "New best joint_score=%.4f (model_utility=%.4f, forget_Q_A_NER=%.4f) at step %d → saved to %s",
+                        joint_score, mu, ner, self.state.global_step, best_dir,
                     )
                 return eval_metrics
 
@@ -138,3 +151,21 @@ class FinetuneTrainer(Trainer):
             return {}
         # Run the default HF Trainer evaluate method when eval dataset is provided
         return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+
+    def train(self, *args, **kwargs):
+        result = super().train(*args, **kwargs)
+        if self.accelerator.is_local_main_process:
+            run_dir = self._get_output_dir(trial=None)
+            last_dir = os.path.join(run_dir, "last")
+            # Remove stale evals before saving so they can't outlive the model
+            stale_evals = os.path.join(last_dir, "evals")
+            if os.path.exists(stale_evals):
+                shutil.rmtree(stale_evals)
+            self.save_model(last_dir)
+            with open(os.path.join(last_dir, "last_step.json"), "w") as _f:
+                json.dump({"step": self.state.global_step}, _f, indent=2)
+            logger.info(
+                "Final model at step %d → saved to %s",
+                self.state.global_step, last_dir,
+            )
+        return result

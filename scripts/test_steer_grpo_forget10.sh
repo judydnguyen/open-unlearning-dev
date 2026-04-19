@@ -28,17 +28,18 @@ export MASTER_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('', 0)
 echo "Master Port: $MASTER_PORT"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HF_HOME=/data/judy/huggingface
 
 MODEL="Llama-3.2-1B-Instruct"
-FORGET_SPLIT="forget05"
-RETAIN_SPLIT="retain95"
-HOLDOUT_SPLIT="holdout05"
+FORGET_SPLIT="forget10"
+RETAIN_SPLIT="retain90"
+HOLDOUT_SPLIT="holdout10"
 MODEL_PATH="open-unlearning/tofu_${MODEL}_full"
 TASK_NAME=tofu_${MODEL}_${FORGET_SPLIT}_SteerGRPO_v6.0
 GPUS="3"
 
 echo "=========================================="
-echo "Running SteerGRPO unlearning (forget05) v6.0"
+echo "Running SteerGRPO unlearning (forget10) v6.0"
 echo "Model: $MODEL"
 echo "Task: $TASK_NAME"
 echo "=========================================="
@@ -70,7 +71,7 @@ CUDA_VISIBLE_DEVICES=$GPUS /data/judy/conda/envs/unlearning/bin/python src/train
     trainer.method_args.resample_var_threshold=0.02 \
     trainer.method_args.curriculum_softmax_temp=2.0 \
     trainer.method_args.entropy_beta=0.02 \
-    trainer.method_args.retain_loss_weight=0.4
+    trainer.method_args.retain_loss_weight=0.2
 
 echo "=========================================="
 echo "Training completed!"
