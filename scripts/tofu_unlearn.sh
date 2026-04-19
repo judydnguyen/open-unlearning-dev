@@ -6,15 +6,17 @@ echo "Master Port: $MASTER_PORT"
 
 models=(
     # "Llama-3.2-1B-Instruct"
-    "Llama-3.2-3B-Instruct"
+    # "Llama-3.2-3B-Instruct"
     "Llama-3.1-8B-Instruct"
+    "Phi-3.5-mini-instruct"
 )
 trainers_experiments=(
-    # "GradAscent unlearn/tofu/default.yaml"
-    # "GradDiff unlearn/tofu/default.yaml"
-    # "NPO unlearn/tofu/default.yaml"
+    "GradAscent unlearn/tofu/default.yaml"
+    "GradDiff unlearn/tofu/default.yaml"
+    "NPO unlearn/tofu/default.yaml"
     "DPO unlearn/tofu/idk.yaml"
-    # "RMU  unlearn/tofu/default.yaml"
+    "RMU  unlearn/tofu/default.yaml"
+    "SimNPO unlearn/tofu/default.yaml"
 )
 splits=(
     "forget01 holdout01 retain99"
