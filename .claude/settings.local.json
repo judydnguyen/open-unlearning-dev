@@ -95,7 +95,14 @@
       "Bash(PYTHONPATH=src /data/judy/conda/envs/unlearning/bin/python -m unittest tests.test_latent_rmu_retain.TestForgetLossUnchanged -v)",
       "Bash(PYTHONPATH=src /data/judy/conda/envs/unlearning/bin/python -m unittest tests.test_latent_rmu_retain.TestPhase1GradientsDefined -v)",
       "Bash(bash scripts/test_steer_grpo_v5.7_repro.sh)",
-      "Bash(bash /home/judy/code/open-unlearning-dev/scripts/test_steer_grpo_forget05.sh)"
+      "Bash(bash /home/judy/code/open-unlearning-dev/scripts/test_steer_grpo_forget05.sh)",
+      "Bash(pdflatex -interaction=nonstopmode neurips_2026.tex)",
+      "Bash(dpkg -l)",
+      "Read(//usr/share/texlive/**)",
+      "Bash(apt-cache search *)",
+      "Bash(bibtex neurips_2026)",
+      "Bash(awk -F: '{print $NF}')",
+      "Bash(sort -t- -k2 -n)"
     ],
     "additionalDirectories": [
       "/home/judy/code/open-unlearning-dev/scripts",

@@ -127,7 +127,7 @@ class FinetuneTrainer(Trainer):
                 mu = eval_metrics.get("model_utility")
                 ner = eval_metrics.get("forget_Q_A_NER")
                 if mu is not None and ner is not None:
-                    joint_score = (mu + (1.0 - ner)) / 2.0
+                    joint_score = (mu + ner) / 2.0
                 else:
                     joint_score = None
                 if joint_score is not None and joint_score > self._best_forget_quality:

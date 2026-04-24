@@ -31,7 +31,7 @@ class LatentRMU(GradDiff):
     def __init__(
         self,
         module_regex="model\.layers\.7",
-        trainable_params_regex=["model\.layers\.(5|6|7)\.mlp\.down_proj\.weight"],
+        trainable_params_regex=["model\.layers\.(5|6|7|8)\.mlp\..*\.weight"],
         steering_coeff=20,
         latent_dim=256,
         encoder_epochs=2,
@@ -41,7 +41,8 @@ class LatentRMU(GradDiff):
         encoder_lr=1e-3,
         retain_pca_components=64,
         forget_warmup_steps=0,
-        coeff_warmup_steps=0,
+        anchor_weight=1.0,
+        retain_basis_batches=20,
         use_lora=False,
         lora_r=8,
         lora_alpha=16,
@@ -65,14 +66,21 @@ class LatentRMU(GradDiff):
         self.retain_sep_weight = retain_sep_weight
         self.encoder_lr = encoder_lr
         self.forget_warmup_steps = forget_warmup_steps
-        self.coeff_warmup_steps = coeff_warmup_steps
+        self.anchor_weight = anchor_weight
+        self.retain_basis_batches = retain_basis_batches
         self._phase = 1
         self._phase2_step = 0
-        self.anchor_weight = 1.0
 
         hidden_size = self.model.config.hidden_size
         self.encoder = PerSampleEncoder(hidden_size, latent_dim)
         self.encoder.to(next(self.model.parameters()).device)
+
+        self.retain_pca_components = 256
+
+        # after self._phase2_step = 0
+        self._retain_basis = None       # (k, H) float32, rows are orthonormal retain directions
+        self._retain_mean = None        # (H,) float32, for centering
+        self._basis_step = 0            # counts Phase 1 steps since last refresh
 
     # ------------------------------------------------------------------ #
     #  Helpers                                                             #
@@ -101,9 +109,9 @@ class LatentRMU(GradDiff):
         if isinstance(model, deepspeed.DeepSpeedEngine):
             model = model.module
         matched = {n: m for n, m in model.named_modules() if re.fullmatch(module_regex, n)}
-        if len(matched) != 1:
-            raise ValueError(f"Expected 1 module match for {module_regex}, got {len(matched)}")
-        return next(iter(matched.values()))
+        if len(matched) == 0:
+            raise ValueError(f"No module matches for {module_regex}")
+        return list(matched.values())
 
     def _freeze_all_params(self, model, requires_grad=False):
         for p in model.parameters():
@@ -122,15 +130,72 @@ class LatentRMU(GradDiff):
             and p.requires_grad
         ]
 
+    def _build_retain_basis(self):
+        """Collect retain activations from ref_model and compute top-k PCA basis."""
+        self.ref_model.eval()
+        acts = []
+        # Grab an iterator over retain data. Trainer builds train_dataloader from the
+        # combined forget+retain dataset; we pull retain_inputs out of each batch.
+        loader = self.get_train_dataloader()
+        device = next(self.model.parameters()).device
+
+        with torch.no_grad():
+            for i, batch in enumerate(loader):
+                if i >= self.retain_basis_batches:
+                    break
+                retain_inputs = {
+                    k: batch["retain"][k].to(device)
+                    for k in ("input_ids", "attention_mask", "labels")
+                }
+                h, _ = self.forward_with_cache(
+                    self.ref_model, retain_inputs, self.ref_module, no_grad=True
+                )  # (B, S, H)
+                mask = (retain_inputs["labels"] != -100).unsqueeze(-1).float()  # (B,S,1)
+                pooled = (h.float() * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)  # (B, H)
+                acts.append(pooled.cpu())
+
+        X = torch.cat(acts, dim=0)                      # (N, H)
+        mean = X.mean(dim=0, keepdim=True)              # (1, H)
+        Xc = X - mean
+        k = min(self.retain_pca_components, Xc.shape[0] - 1, Xc.shape[1])
+        _, _, V = torch.pca_lowrank(Xc, q=k, center=False)  # V: (H, k)
+        basis = V.T.contiguous().to(device).float()     # (k, H)
+
+        self._retain_basis = basis
+        self._retain_mean = mean.squeeze(0).to(device).float()
+        self._basis_step = 0
+        print(f"[DEBUG] built retain basis: {basis.shape}, "
+            f"explained_var_ratio≈{(Xc @ V).pow(2).sum() / Xc.pow(2).sum():.4f}", flush=True)
+
+
+    def _subspace_conflict(self, r: torch.Tensor) -> torch.Tensor:
+        """Fraction of squared energy of r that lies in the retain subspace.
+
+        r: (B, H) — encoder output, before/after norm rescaling both work since
+        we normalize here explicitly. Returns a scalar in [0, 1].
+        """
+        r_centered = r - self._retain_mean.to(r.dtype)
+        r_unit = F.normalize(r_centered, dim=-1)           # (B, H)
+        basis = self._retain_basis.to(r.dtype)             # (k, H)
+        proj = r_unit @ basis.T                            # (B, k)
+        # Squared cosine energy captured by retain subspace, averaged over batch.
+        return proj.pow(2).sum(dim=-1).mean()
+
     def forward_with_cache(self, model, inputs, module, no_grad=True):
-        cache = []
-        def hook(module, input, output):
-            cache.append(output[0] if isinstance(output, tuple) else output)
-        handle = module.register_forward_hook(hook)
+        modules = module if isinstance(module, list) else [module]
+        caches = {id(m): [] for m in modules}
+        def make_hook(mid):
+            def hook(m, inp, out):
+                caches[mid].append(out[0] if isinstance(out, tuple) else out)
+            return hook
+        handles = [m.register_forward_hook(make_hook(id(m))) for m in modules]
         with torch.set_grad_enabled(not no_grad):
             outputs = model(**inputs)
-        handle.remove()
-        return cache[0], outputs
+        for h in handles:
+            h.remove()
+        acts = [caches[id(m)][0] for m in modules]
+        h_avg = torch.stack(acts, dim=0).mean(dim=0)
+        return h_avg, outputs
 
     def compute_activation_loss(self, activation1, activation2, mask):
         squared_diff = F.mse_loss(activation1, activation2, reduction="none")
@@ -210,45 +275,46 @@ class LatentRMU(GradDiff):
         print(f"[DEBUG] g1 norm={g1.norm().item():.4f}, g2 norm={g2.norm().item():.4f}, cos_sim={cos_sim.item():.4f}, result={( cos_sim**2).item():.6f}", flush=True)
         return cos_sim ** 2
 
-    def _ramped_steering_coeff(self) -> float:
-        if self.coeff_warmup_steps <= 0:
-            return self.steering_coeff
-        return self.steering_coeff * max(0.0, 1.0 - self._phase2_step / self.coeff_warmup_steps)
-
-    def _get_steering_vectors(self, h_forget: torch.Tensor, steering_coeff: float = None) -> torch.Tensor:
+    def _get_steering_vectors(self, h_forget: torch.Tensor) -> torch.Tensor:
         pooled = h_forget.float().mean(dim=1)
         r = self.encoder(pooled)
-        r = r / (r.norm(dim=-1, keepdim=True) + 1e-8)
-        return r.unsqueeze(1).to(h_forget.dtype) * (steering_coeff or self.steering_coeff)
+        r = r / (r.norm(dim=-1, keepdim=True) + 1e-8) * self.steering_coeff
+        return r.unsqueeze(1).to(h_forget.dtype)
 
-    # def _create_intervention_hook(self, steering_vector: torch.Tensor, coeff: float = None):
-    #     """Hook that adds a steering displacement relative to the activation norm.
+    def _encode_steering(self, h_forget: torch.Tensor) -> torch.Tensor:
+        pooled = h_forget.float().mean(dim=1)
+        r = self.encoder(pooled)
+        r = r / (r.norm(dim=-1, keepdim=True) + 1e-8) * self.steering_coeff
+        return r.unsqueeze(1).expand_as(h_forget)
 
-    #     displacement = direction * ||activation|| * coeff
+    def _create_intervention_hook(self, steering_vector: torch.Tensor, coeff: float = None):
+        """Hook that adds a steering displacement relative to the activation norm.
 
-    #     Args:
-    #         steering_vector: (hidden,) for a single shared vector, or
-    #                          (batch, hidden) for per-sample vectors.
-    #         coeff: scaling coefficient. Defaults to self.steering_coeff.
-    #     """
-    #     if coeff is None:
-    #         coeff = self.steering_coeff
+        displacement = direction * ||activation|| * coeff
 
-    #     if steering_vector.dim() == 1:
-    #         direction = steering_vector.unsqueeze(0).unsqueeze(0)  # (1,1,H)
-    #     else:
-    #         direction = steering_vector.unsqueeze(1)  # (B,1,H)
-    #     direction = direction / (direction.norm(p=2, dim=-1, keepdim=True) + 1e-8)
+        Args:
+            steering_vector: (hidden,) for a single shared vector, or
+                             (batch, hidden) for per-sample vectors.
+            coeff: scaling coefficient. Defaults to self.steering_coeff.
+        """
+        if coeff is None:
+            coeff = self.steering_coeff
 
-    #     def intervention_hook(module, _input, output):
-    #         h = output[0] if isinstance(output, tuple) else output
-    #         scale = h.norm(p=2, dim=-1, keepdim=True) * coeff  # (B,S,1)
-    #         modified = h + direction * scale
-    #         if isinstance(output, tuple):
-    #             return (modified,) + output[1:]
-    #         return modified
+        if steering_vector.dim() == 1:
+            direction = steering_vector.unsqueeze(0).unsqueeze(0)  # (1,1,H)
+        else:
+            direction = steering_vector.unsqueeze(1)  # (B,1,H)
+        direction = direction / (direction.norm(p=2, dim=-1, keepdim=True) + 1e-8)
 
-    #     return intervention_hook
+        def intervention_hook(module, _input, output):
+            h = output[0] if isinstance(output, tuple) else output
+            scale = h.norm(p=2, dim=-1, keepdim=True) * coeff  # (B,S,1)
+            modified = h + direction * scale
+            if isinstance(output, tuple):
+                return (modified,) + output[1:]
+            return modified
+
+        return intervention_hook
 
     def compute_loss(self, model, inputs, return_outputs=False):
         forget_inputs = {k: inputs["forget"][k] for k in ("input_ids", "attention_mask", "labels")}
@@ -318,84 +384,138 @@ class LatentRMU(GradDiff):
 
         #     loss = self.orth_weight * grad_conflict_term + self.retain_sep_weight * retain_sep_loss
 
+        ########## OLD CODE FROM HERE ##########
+        # if self._phase == 1:
+        #     h_forget, _ = self.forward_with_cache(
+        #         self.model, forget_inputs, self.model_module, no_grad=False
+        #     )
+
+        #     r_expanded = h_forget + self._encode_steering(h_forget)
+
+        #     forget_loss = self.compute_activation_loss(
+        #         h_forget.float(), r_expanded.float(), mask
+        #     )
+
+        #     # For grad_retain we need a loss that is non-zero even when model == ref.
+        #     # EMBED_DIFF = MSE(model_act, ref_act) = 0 throughout Phase 1 because
+        #     # phase2_params are frozen, so the model never diverges from ref.
+        #     # Use NLL instead, which has a non-zero gradient at any model state.
+        #     retain_loss_for_conflict = self.model(**retain_inputs).loss
+
+        #     phase2_params = self._get_phase2_params()
+        #     print(f"[DEBUG] n_phase2_params={len(phase2_params)}", flush=True)
+
+        #     if phase2_params and self.orth_weight > 0.0:
+        #         grad_forget = torch.autograd.grad(
+        #             forget_loss, phase2_params,
+        #             create_graph=True, allow_unused=True, retain_graph=True,
+        #         )
+
+        #         grad_retain = torch.autograd.grad(
+        #             retain_loss_for_conflict, phase2_params,
+        #             create_graph=False, allow_unused=True,
+        #         )
+        #         grad_retain = [g.detach() if g is not None else None for g in grad_retain]
+
+        #         paired = [
+        #             (g1, g2) for g1, g2 in zip(grad_forget, grad_retain)
+        #             if g1 is not None and g2 is not None
+        #         ]
+        #     else:
+        #         paired = []
+        #     print(f"[DEBUG] forget_loss={forget_loss.item():.4f}, retain_nll={retain_loss_for_conflict.item():.4f}, "
+        #         f"shared_params={len(paired)}/{len(phase2_params)}", flush=True)
+
+        #     h_retain_ref, _ = self.forward_with_cache(
+        #         self.ref_model, retain_inputs, self.ref_module, no_grad=True
+        #     )
+        #     retain_pooled = h_retain_ref.float().mean(dim=1)  # (B, H)
+        #     r_unit = F.normalize(r_expanded[:, 0, :].float(), dim=-1)   # (B, H)
+        #     retain_unit = F.normalize(retain_pooled, dim=-1)   # (B, H)
+        #     retain_sep_loss = (r_unit * retain_unit).sum(dim=-1).abs().mean()
+
+        #     # anchor: pull encoder direction toward "can't answer" activations
+        #     dontknow_dirs = self._get_dontknow_activations(forget_inputs)  # (B, H)
+        #     anchor_loss = 1 - (r_unit * dontknow_dirs).sum(dim=-1).mean()
+
+        #     if not paired:
+        #         print("[DEBUG] no shared params with grad — check module_regex covers trainable layers", flush=True)
+        #         grad_conflict_term = torch.tensor(0.0, device=h_forget.device)
+        #     else:
+        #         g1 = torch.cat([g1.flatten() for g1, _ in paired])
+        #         g2 = torch.cat([g2.flatten() for _, g2 in paired])
+        #         cos_sim = F.cosine_similarity(g1.unsqueeze(0), g2.unsqueeze(0)).squeeze()
+        #         grad_conflict_term = cos_sim ** 2
+        #         print(f"[DEBUG] g1 norm={g1.norm().item():.4f}, g2 norm={g2.norm().item():.4f}, "
+        #             f"cos_sim={cos_sim.item():.4f}, conflict={grad_conflict_term.item():.6f}, "
+        #             f"retain_sep={retain_sep_loss.item():.4f}, anchor={anchor_loss.item():.4f}", flush=True)
+
+        #     loss = (self.orth_weight * grad_conflict_term
+        #         + self.retain_sep_weight * retain_sep_loss
+        #         + self.anchor_weight * anchor_loss)
+
         if self._phase == 1:
+            # Refresh retain basis if needed.
+            if self._retain_basis is None or self._basis_step >= self.retain_basis_batches:
+                self._build_retain_basis()
+            self._basis_step += 1
+
             h_forget, _ = self.forward_with_cache(
                 self.model, forget_inputs, self.model_module, no_grad=False
             )
 
-            pooled = h_forget.float().mean(dim=1)
-            r = self.encoder(pooled)
-            r = r / (r.norm(dim=-1, keepdim=True) + 1e-8) * self.steering_coeff
-            r_expanded = r.unsqueeze(1).expand_as(h_forget) + h_forget
-
+            # # Encoder forward
+            # pooled = h_forget.float().mean(dim=1)                      # (B, H)
+            # r = self.encoder(pooled)                                   # (B, H)
+            # r_scaled = r / (r.norm(dim=-1, keepdim=True) + 1e-8) * self.steering_coeff
+            # r_expanded = (h_forget + r_scaled.unsqueeze(1)).to(h_forget.dtype)
+            r_expanded = self._encode_steering(h_forget)
+            r = r_expanded[:, 0, :]  # (B, H) — the steering vector added to the first token's activation, which is what we use for conflict and subspace losses
+            # Forget loss: MSE against steered target (same as before)
             forget_loss = self.compute_activation_loss(
-                h_forget.float(), r_expanded.detach().float(), mask
+                h_forget.float(), r_expanded.float(), mask
             )
 
-            # For grad_retain we need a loss that is non-zero even when model == ref.
-            # EMBED_DIFF = MSE(model_act, ref_act) = 0 throughout Phase 1 because
-            # phase2_params are frozen, so the model never diverges from ref.
-            # Use NLL instead, which has a non-zero gradient at any model state.
-            retain_loss_for_conflict = self.model(**retain_inputs).loss
+            # Subspace conflict: how much of r lives in the retain PCA subspace?
+            subspace_term = self._subspace_conflict(r)  # (B, H) → (B,)
 
-            phase2_params = self._get_phase2_params()
-            print(f"[DEBUG] n_phase2_params={len(phase2_params)}", flush=True)
-
-            grad_forget = torch.autograd.grad(
-                forget_loss, phase2_params,
-                create_graph=True, allow_unused=True, retain_graph=True,
-            )
-
-            grad_retain = torch.autograd.grad(
-                retain_loss_for_conflict, phase2_params,
-                create_graph=False, allow_unused=True,
-            )
-            grad_retain = [g.detach() if g is not None else None for g in grad_retain]
-
-            paired = [
-                (g1, g2) for g1, g2 in zip(grad_forget, grad_retain)
-                if g1 is not None and g2 is not None
-            ]
-            print(f"[DEBUG] forget_loss={forget_loss.item():.4f}, retain_nll={retain_loss_for_conflict.item():.4f}, "
-                f"shared_params={len(paired)}/{len(phase2_params)}", flush=True)
+            # Anchor toward don't-know directions (unchanged)
+            dontknow_dirs = self._get_dontknow_activations(forget_inputs)  # (B, H)
+            r_unit_for_anchor = F.normalize(r.float(), dim=-1)
+            anchor_loss = 1 - (r_unit_for_anchor * dontknow_dirs).sum(dim=-1).mean()
 
             h_retain_ref, _ = self.forward_with_cache(
                 self.ref_model, retain_inputs, self.ref_module, no_grad=True
             )
             retain_pooled = h_retain_ref.float().mean(dim=1)  # (B, H)
-            r_unit = F.normalize(r, dim=-1)                    # (B, H)
+            r_unit = F.normalize(r_expanded[:, 0, :].float(), dim=-1)   # (B, H)
             retain_unit = F.normalize(retain_pooled, dim=-1)   # (B, H)
             retain_sep_loss = (r_unit * retain_unit).sum(dim=-1).abs().mean()
 
-            # anchor: pull encoder direction toward "can't answer" activations
-            dontknow_dirs = self._get_dontknow_activations(forget_inputs)  # (B, H)
-            anchor_loss = 1 - (r_unit * dontknow_dirs).sum(dim=-1).mean()
+            print(f"[DEBUG] forget_loss={forget_loss.item():.4f}, "
+                f"subspace={subspace_term.item():.4f}, "
+                f"anchor={anchor_loss.item():.4f}, "
+                f"retain_sep={retain_sep_loss.item():.4f}", flush=True)
 
-            if not paired:
-                print("[DEBUG] no shared params with grad — check module_regex covers trainable layers", flush=True)
-                grad_conflict_term = torch.tensor(0.0, device=h_forget.device)
-            else:
-                g1 = torch.cat([g1.flatten() for g1, _ in paired])
-                g2 = torch.cat([g2.flatten() for _, g2 in paired])
-                cos_sim = F.cosine_similarity(g1.unsqueeze(0), g2.unsqueeze(0)).squeeze()
-                grad_conflict_term = cos_sim ** 2
-                print(f"[DEBUG] g1 norm={g1.norm().item():.4f}, g2 norm={g2.norm().item():.4f}, "
-                    f"cos_sim={cos_sim.item():.4f}, conflict={grad_conflict_term.item():.6f}, "
-                    f"retain_sep={retain_sep_loss.item():.4f}, anchor={anchor_loss.item():.4f}", flush=True)
-
-            loss = (self.orth_weight * grad_conflict_term
-                + self.retain_sep_weight * retain_sep_loss
-                + self.anchor_weight * anchor_loss)
+            loss = (self.orth_weight * subspace_term
+                    + self.anchor_weight * anchor_loss
+                    + self.retain_sep_weight * retain_sep_loss)
+            # Note: forget_loss is not added. The encoder's job in Phase 1 is to find
+            # a direction that (a) is outside the retain subspace and (b) points toward
+            # don't-know activations. The MSE-against-steered-target signal belongs to
+            # Phase 2. Include `forget_loss` here with a small weight if you want the
+            # encoder to also care about magnitude realizability.
         else:
             h_forget, forget_outputs = self.forward_with_cache(
                 self.model, forget_inputs, self.model_module, no_grad=False
             )
 
-            h_forget_ref, _ = self.forward_with_cache(
-                self.ref_model, forget_inputs, self.ref_module, no_grad=True
-            )
             with torch.no_grad():
-                control_vec = self._get_steering_vectors(h_forget, self._ramped_steering_coeff()) + h_forget_ref
+                # calc h_forget_ref
+                h_forget_ref, _ = self.forward_with_cache(
+                    self.ref_model, forget_inputs, self.ref_module, no_grad=True
+                )
+                control_vec = self._get_steering_vectors(h_forget_ref)
             control_vec = control_vec.expand_as(h_forget)
             forget_loss = self.compute_activation_loss(h_forget, control_vec, mask)
             retain_loss = self.compute_retain_loss(model, retain_inputs)
@@ -415,6 +535,7 @@ class LatentRMU(GradDiff):
             })
 
         return (loss, forget_outputs) if (return_outputs and self._phase == 2) else loss
+    
     def compute_retain_loss(self, model, retain_inputs):
         if self.retain_loss_type == "EMBED_DIFF":
             model_retain_act, _ = self.forward_with_cache(
