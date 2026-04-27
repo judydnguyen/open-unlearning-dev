@@ -1,0 +1,38 @@
+defaults:
+  - GradDiff
+
+handler: LoRANullRMU
+
+args:
+  learning_rate: 1e-5
+  num_train_epochs: 9
+
+method_args:
+  module_regex: "model\\.layers\\.7"
+
+  trainable_params_regex:
+    - "model\\.layers\\.(5|6|7)\\.mlp\\.down_proj\\.weight"
+
+  latent_dim: 256
+  encoder_layers: 2
+  encoder_epochs: 2
+  encoder_lr: 1e-3
+
+  null_align_weight: 1.0
+  displacement_weight: 1.0
+
+  forget_warmup_steps: 0
+  steering_coeff: 20.0
+
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  lora_target_modules: null
+
+  null_eigenvalue_threshold: 1e-2
+  retain_basis_batches: 20
+  use_null_grad_hooks: false
+
+  gamma: 1.0
+  alpha: 1.0
+  retain_loss_type: EMBED_DIFF

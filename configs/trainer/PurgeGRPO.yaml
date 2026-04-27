@@ -1,0 +1,29 @@
+defaults:
+  - finetune
+
+handler: PurgeGRPO
+method_args:
+  # GRPO sampling
+  group_size: 4
+  max_new_tokens: 64
+  temperature: 1.0
+  epsilon: 0.2              # PPO-style clipping (0 = no clip)
+  # PURGE reward — all SteerGRPO auxiliary signals disabled
+  answer_reward_weight: 0.0
+  naturalness_reward_weight: 0.0
+  retain_reward_weight: 0.0
+  retain_loss_weight: 0.0
+  kl_beta: 0.0
+  entropy_beta: 0.0
+  curriculum: false
+  # Group resampling (keeps training stable when reward variance collapses)
+  resample_low_var: true
+  resample_var_threshold: 0.02
+  resample_temp_factor: 1.5
+  resample_max_tries: 3
+  # Forget words: null = auto-extract from forget dataset answer labels
+  # Override with a list to pin specific terms, e.g.:
+  #   forget_words: [Harry, Potter, Hogwarts, Voldemort]
+  forget_words: null
+  log_completions_steps: 10
+  use_lora: false

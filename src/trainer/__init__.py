@@ -23,7 +23,7 @@ from trainer.unlearn.SteerGRPO import SteerGRPO
 from trainer.unlearn.SteerGRPOSimple import SteerGRPOSimple
 from trainer.unlearn.PurgeGRPO import PurgeGRPO
 from trainer.unlearn.SteerGRPO_multiGPU import SteerGRPOMultiGPU
-from trainer.unlearn.rmu_encoder import LatentRMU
+from trainer.unlearn.rmu_encoder_parallel import LatentRMU
 
 
 import logging

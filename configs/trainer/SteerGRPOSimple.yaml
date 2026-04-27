@@ -1,0 +1,18 @@
+defaults:
+  - finetune
+
+handler: SteerGRPOSimple
+method_args:
+  group_size: 4
+  max_new_tokens: 64
+  temperature: 1.2
+  epsilon: 0.2              # PPO-style clipping (0 = no clip)
+  entropy_beta: 0.02        # output diversity bonus; try 0.01–0.05
+  answer_reward_weight: 0.75  # weight on anti-answer; remainder goes to ref divergence
+  retain_loss_weight: 0.5    # NLL on retain samples to anchor utility; 0 = disabled
+  log_completions_steps: 10
+  use_lora: false
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  lora_target_modules: null

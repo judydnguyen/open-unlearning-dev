@@ -111,8 +111,7 @@
       "Bash(/usr/bin/python3.10 -c \"import matplotlib; print\\(matplotlib.__version__\\)\")",
       "Bash(/usr/bin/python3.10 -c \"import jupyter\")",
       "Bash(/usr/bin/python3.9 -c \"import matplotlib; print\\(matplotlib.__version__\\)\")",
-      "Bash(env)",
-      "Bash(huggingface-cli whoami *)"
+      "Bash(env)"
     ],
     "additionalDirectories": [
       "/home/judy/code/open-unlearning-dev/scripts",
