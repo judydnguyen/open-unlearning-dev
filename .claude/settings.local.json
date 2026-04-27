@@ -102,7 +102,16 @@
       "Bash(apt-cache search *)",
       "Bash(bibtex neurips_2026)",
       "Bash(awk -F: '{print $NF}')",
-      "Bash(sort -t- -k2 -n)"
+      "Bash(sort -t- -k2 -n)",
+      "Bash([ -d \"$d/last\" ])",
+      "Bash(PYTHON=/data/judy/conda/envs/unlearning/bin/python MPLCONFIGDIR=/tank/home/judy/.cache/matplotlib /data/judy/conda/envs/unlearning/bin/python scripts/repr_analysis.py --config analysis_configs/tofu_1b_forget10.json)",
+      "Bash(jupyter nbconvert *)",
+      "Bash(python3.12 -c \"import matplotlib; print\\(matplotlib.__version__\\)\")",
+      "Bash(/tank/home/judy/.local/bin/python3.12 -c \"import matplotlib\")",
+      "Bash(/usr/bin/python3.10 -c \"import matplotlib; print\\(matplotlib.__version__\\)\")",
+      "Bash(/usr/bin/python3.10 -c \"import jupyter\")",
+      "Bash(/usr/bin/python3.9 -c \"import matplotlib; print\\(matplotlib.__version__\\)\")",
+      "Bash(env)"
     ],
     "additionalDirectories": [
       "/home/judy/code/open-unlearning-dev/scripts",

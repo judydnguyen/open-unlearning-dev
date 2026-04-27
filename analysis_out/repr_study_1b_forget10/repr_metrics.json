@@ -1,0 +1,74 @@
+{
+  "Finetuned": {
+    "forget_cosine_dist_to_retrained": 0.043750911951065063,
+    "forget_l2_dist_to_retrained": 15.14889907836914,
+    "forget_centroid_cosine_to_retrained": 0.012933492660522461,
+    "retain_cosine_dist_to_retrained": 0.015264973975718021,
+    "retain_l2_dist_to_retrained": 9.105169296264648,
+    "retain_centroid_cosine_to_retrained": 0.0071631669998168945,
+    "forget_retain_centroid_gap": 0.03895461559295654
+  },
+  "Retrained": {
+    "forget_cosine_dist_to_retrained": -3.784894886393886e-07,
+    "forget_l2_dist_to_retrained": 0.0,
+    "forget_centroid_cosine_to_retrained": 3.5762786865234375e-07,
+    "retain_cosine_dist_to_retrained": -3.8623809928139963e-07,
+    "retain_l2_dist_to_retrained": 0.0,
+    "retain_centroid_cosine_to_retrained": -1.1920928955078125e-07,
+    "forget_retain_centroid_gap": 0.033776700496673584
+  },
+  "GradAscent": {
+    "forget_cosine_dist_to_retrained": 0.839480996131897,
+    "forget_l2_dist_to_retrained": 107.48908233642578,
+    "forget_centroid_cosine_to_retrained": 0.7950773239135742,
+    "retain_cosine_dist_to_retrained": 0.8208975195884705,
+    "retain_l2_dist_to_retrained": 105.76314544677734,
+    "retain_centroid_cosine_to_retrained": 0.7619407773017883,
+    "forget_retain_centroid_gap": 0.0012996196746826172
+  },
+  "GradDiff": {
+    "forget_cosine_dist_to_retrained": 0.8501237630844116,
+    "forget_l2_dist_to_retrained": 107.86978149414062,
+    "forget_centroid_cosine_to_retrained": 0.8158575892448425,
+    "retain_cosine_dist_to_retrained": 0.13712380826473236,
+    "retain_l2_dist_to_retrained": 27.415918350219727,
+    "retain_centroid_cosine_to_retrained": 0.13748759031295776,
+    "forget_retain_centroid_gap": 0.7125973105430603
+  },
+  "NPO": {
+    "forget_cosine_dist_to_retrained": 0.19307872653007507,
+    "forget_l2_dist_to_retrained": 44.47797775268555,
+    "forget_centroid_cosine_to_retrained": 0.1269378662109375,
+    "retain_cosine_dist_to_retrained": 0.20267288386821747,
+    "retain_l2_dist_to_retrained": 44.98841857910156,
+    "retain_centroid_cosine_to_retrained": 0.13744544982910156,
+    "forget_retain_centroid_gap": 0.00924605131149292
+  },
+  "RMU": {
+    "forget_cosine_dist_to_retrained": 0.8418314456939697,
+    "forget_l2_dist_to_retrained": 97.91067504882812,
+    "forget_centroid_cosine_to_retrained": 0.7311464548110962,
+    "retain_cosine_dist_to_retrained": 0.025771109387278557,
+    "retain_l2_dist_to_retrained": 11.431474685668945,
+    "retain_centroid_cosine_to_retrained": 0.010968983173370361,
+    "forget_retain_centroid_gap": 0.7276171445846558
+  },
+  "SimNPO": {
+    "forget_cosine_dist_to_retrained": 0.04774805158376694,
+    "forget_l2_dist_to_retrained": 15.732414245605469,
+    "forget_centroid_cosine_to_retrained": 0.01696711778640747,
+    "retain_cosine_dist_to_retrained": 0.016385076567530632,
+    "retain_l2_dist_to_retrained": 9.396039009094238,
+    "retain_centroid_cosine_to_retrained": 0.007586359977722168,
+    "forget_retain_centroid_gap": 0.04118311405181885
+  },
+  "LatentRMU": {
+    "forget_cosine_dist_to_retrained": 0.038342226296663284,
+    "forget_l2_dist_to_retrained": 14.267250061035156,
+    "forget_centroid_cosine_to_retrained": 0.011035442352294922,
+    "retain_cosine_dist_to_retrained": 0.017341267317533493,
+    "retain_l2_dist_to_retrained": 9.867209434509277,
+    "retain_centroid_cosine_to_retrained": 0.009827196598052979,
+    "forget_retain_centroid_gap": 0.03507435321807861
+  }
+}

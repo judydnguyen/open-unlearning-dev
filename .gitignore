@@ -184,3 +184,5 @@ cython_debug/
 
 saves/
 *_output/
+
+**/.acts_cache/

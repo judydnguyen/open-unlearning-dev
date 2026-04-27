@@ -1,0 +1,23 @@
+{
+  "comment": "Representation study for Llama-3.2-1B on forget10. Finetuned = memorized model; Retrained = gold oracle.",
+  "base_model":      "saves/finetune/tofu_Llama-3.2-1B-Instruct_full",
+  "retrained_model": "saves/finetune/tofu_Llama-3.2-1B-Instruct_retain90",
+  "methods": [
+    {"name": "GradAscent", "path": "saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget10_GradAscent"},
+    {"name": "GradDiff",   "path": "saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget10_GradDiff"},
+    {"name": "NPO",        "path": "saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget10_NPO"},
+    {"name": "RMU",        "path": "saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget10_RMU"},
+    {"name": "SimNPO",     "path": "saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget10_SimNPO"},
+    {"name": "LatentRMU",  "path": "saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget10_LatentRMU_v4.8/last"},
+    {"name": "SimNPO",     "path": "saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget10_SimNPO/last"}
+  ],
+  "forget_data": "forget10",
+  "retain_data":  "retain90",
+  "layers": [-1, 12, 8, 6, 1],
+  "latent_layer": 8,
+  "max_forget_samples": 200,
+  "max_retain_samples": 200,
+  "batch_size": 4,
+  "highlight": "LatentRMU",
+  "output_dir": "analysis_out/repr_study_1b_forget10"
+}

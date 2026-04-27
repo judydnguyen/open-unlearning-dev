@@ -333,35 +333,60 @@ COLORS = {
     "Unlearned": "#6acc65",
 }
 
+# Extra palette slots for additional methods beyond "Unlearned"
+_EXTRA_PALETTE = [
+    "#e6a817",  # amber
+    "#9d4edd",  # purple
+    "#2ec4b6",  # teal
+    "#f77f00",  # orange
+    "#e63946",  # crimson
+]
+
+
+def _color_for(name: str, extra_idx: int) -> str:
+    if name in COLORS:
+        return COLORS[name]
+    return _EXTRA_PALETTE[extra_idx % len(_EXTRA_PALETTE)]
+
+
+def _build_color_map(names: List[str]) -> Dict[str, str]:
+    color_map: Dict[str, str] = {}
+    extra_idx = 0
+    for name in names:
+        color_map[name] = _color_for(name, extra_idx)
+        if name not in COLORS:
+            extra_idx += 1
+    return color_map
+
 
 def visualize_rouge(
-    rouge_base: List[Dict],
-    rouge_ft:   List[Dict],
-    rouge_ul:   List[Dict],
-    out_dir:    Path,
+    model_rouge: Dict[str, List[Dict]],
+    out_dir:     Path,
 ) -> None:
-    """Boxplot comparing ROUGE scores across the three model states."""
-    metrics = ["rouge1_r", "rouge2_r", "rougeL_f1", "rougeL_r"]
-    labels  = ["Base", "Finetuned", "Unlearned"]
+    """Boxplot comparing ROUGE scores across all models."""
+    metrics    = ["rouge1_r", "rouge2_r", "rougeL_f1", "rougeL_r"]
+    names      = list(model_rouge.keys())
+    color_map  = _build_color_map(names)
+    n_methods  = len(names)
 
-    fig, axes = plt.subplots(1, len(metrics), figsize=(14, 4))
+    fig, axes = plt.subplots(1, len(metrics),
+                             figsize=(max(14, 3 * n_methods), 4))
 
     for ax, metric in zip(axes, metrics):
-        data = [
-            [r[metric] for r in rouge_base],
-            [r[metric] for r in rouge_ft],
-            [r[metric] for r in rouge_ul],
-        ]
-        bp = ax.boxplot(data, patch_artist=True, widths=0.5)
-        for patch, label in zip(bp["boxes"], labels):
-            patch.set_facecolor(COLORS[label])
-            patch.set_alpha(0.7)
-        ax.set_xticklabels(labels, fontsize=9)
+        data = [[r[metric] for r in model_rouge[n]] for n in names]
+        bp   = ax.boxplot(data, patch_artist=True,
+                          widths=0.55, medianprops=dict(color="black", linewidth=1.5))
+        for patch, name in zip(bp["boxes"], names):
+            patch.set_facecolor(color_map[name])
+            patch.set_alpha(0.75)
+        labels = ["Ours" if n == "LatentRMU" else n for n in names]
+        ax.set_xticks(range(1, n_methods + 1))
+        ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
         ax.set_title(metric.replace("_", " ").upper(), fontsize=10)
         ax.set_ylabel("Score")
         ax.grid(axis="y", alpha=0.3)
 
-    fig.suptitle("ROUGE Score Comparison: Base vs Finetuned vs Unlearned", fontsize=12)
+    fig.suptitle("ROUGE Score Comparison across Methods", fontsize=12)
     fig.tight_layout()
     out_path = out_dir / "rouge_comparison.png"
     fig.savefig(out_path, dpi=150)
@@ -370,67 +395,40 @@ def visualize_rouge(
 
 
 def visualize_rouge_histograms(
-    rouge_base: List[Dict],
-    rouge_ft:   List[Dict],
-    rouge_ul:   List[Dict],
-    out_dir:    Path,
-    bins:       int = 20,
+    model_rouge: Dict[str, List[Dict]],
+    out_dir:     Path,
+    bins:        int = 20,
 ) -> None:
-    """
-    Overlapping histograms of per-sample ROUGE scores for each metric.
-    Each subplot shows the three model distributions as semi-transparent bars
-    plus a vertical dashed line for the mean.
-    Saved as: rouge_histograms.png
-    """
-    metrics = ["rouge1_r", "rouge2_r", "rougeL_f1", "rougeL_r"]
-    model_data = {
-        "Base":      rouge_base,
-        "Finetuned": rouge_ft,
-        "Unlearned": rouge_ul,
-    }
+    """Overlapping histograms of per-sample ROUGE scores for all models."""
+    metrics   = ["rouge1_r", "rouge2_r", "rougeL_f1", "rougeL_r"]
+    color_map = _build_color_map(list(model_rouge.keys()))
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     axes_flat = axes.flatten()
 
     for ax, metric in zip(axes_flat, metrics):
-        all_vals = [v for rows in model_data.values() for v in [r[metric] for r in rows]]
-        lo, hi   = min(all_vals), max(all_vals)
-        # Avoid degenerate range (e.g. all zeros when rouge2 is 0)
+        all_vals  = [v for rows in model_rouge.values() for v in [r[metric] for r in rows]]
+        lo, hi    = min(all_vals), max(all_vals)
         if hi - lo < 1e-6:
             lo, hi = lo - 0.05, hi + 0.05
         bin_edges = np.linspace(lo, hi, bins + 1)
 
-        for label, rows in model_data.items():
+        for name, rows in model_rouge.items():
             vals = [r[metric] for r in rows]
-            ax.hist(
-                vals,
-                bins=bin_edges,
-                alpha=0.45,
-                color=COLORS[label],
-                label=label,
-                edgecolor="white",
-                linewidth=0.4,
-            )
-            mean_val = float(np.mean(vals))
-            ax.axvline(
-                mean_val,
-                color=COLORS[label],
-                linewidth=1.8,
-                linestyle="--",
-                alpha=0.9,
-            )
+            ax.hist(vals, bins=bin_edges, alpha=0.45,
+                    color=color_map[name], label=name,
+                    edgecolor="white", linewidth=0.4)
+            ax.axvline(float(np.mean(vals)), color=color_map[name],
+                       linewidth=1.8, linestyle="--", alpha=0.9)
 
         ax.set_title(metric.replace("_", " ").upper(), fontsize=10)
         ax.set_xlabel("Score")
         ax.set_ylabel("Count")
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=7)
         ax.grid(axis="y", alpha=0.3)
 
-    fig.suptitle(
-        "ROUGE Score Distributions: Base vs Finetuned vs Unlearned\n"
-        "(dashed lines = means)",
-        fontsize=12,
-    )
+    fig.suptitle("ROUGE Score Distributions across Methods\n(dashed lines = means)",
+                 fontsize=12)
     fig.tight_layout()
     out_path = out_dir / "rouge_histograms.png"
     fig.savefig(out_path, dpi=150)
@@ -439,36 +437,42 @@ def visualize_rouge_histograms(
 
 
 def visualize_activations(
-    acts_base: np.ndarray,
-    acts_ft:   np.ndarray,
-    acts_ul:   np.ndarray,
-    out_dir:   Path,
-    tsne:      bool = False,
+    model_acts: Dict[str, np.ndarray],
+    out_dir:    Path,
+    tsne:       bool = False,
 ) -> None:
-    """PCA (and optionally t-SNE) scatter of activation vectors."""
-    all_acts = np.concatenate([acts_base, acts_ft, acts_ul], axis=0)
-    N = acts_base.shape[0]
+    """PCA (and optionally t-SNE) scatter of activation vectors.
 
-    group_labels = (
-        ["Base"]      * N +
-        ["Finetuned"] * N +
-        ["Unlearned"] * N
-    )
+    model_acts — ordered dict mapping display name → (N, D) activations.
+    """
+    names    = list(model_acts.keys())
+    all_acts = np.concatenate(list(model_acts.values()), axis=0)
+
+    # Assign colors: fixed for Base/Finetuned, palette for the rest.
+    extra_idx = 0
+    color_map: Dict[str, str] = {}
+    for name in names:
+        color_map[name] = _color_for(name, extra_idx)
+        if name not in COLORS:
+            extra_idx += 1
 
     # ── PCA ──────────────────────────────────────────────────────
     n_components = min(2, all_acts.shape[1], all_acts.shape[0])
     pca = PCA(n_components=n_components, random_state=0)
-    proj = pca.fit_transform(all_acts)
-    if proj.shape[1] == 1:
-        proj = np.column_stack([proj, np.zeros(len(proj))])
+    proj_all = pca.fit_transform(all_acts)
+    if proj_all.shape[1] == 1:
+        proj_all = np.column_stack([proj_all, np.zeros(len(proj_all))])
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    for label in ["Base", "Finetuned", "Unlearned"]:
-        mask = [i for i, l in enumerate(group_labels) if l == label]
-        ax.scatter(
-            proj[mask, 0], proj[mask, 1],
-            c=COLORS[label], label=label, alpha=0.7, edgecolors="none", s=40,
-        )
+    offset = 0
+    for name, acts in model_acts.items():
+        n = len(acts)
+        p = proj_all[offset : offset + n]
+        offset += n
+        ax.scatter(p[:, 0], p[:, 1],
+                   c=color_map[name], label=name,
+                   alpha=0.7, edgecolors="none", s=40)
+
     var = pca.explained_variance_ratio_
     ax.set_xlabel(f"PC1 ({var[0]*100:.1f}%)")
     ax.set_ylabel(f"PC2 ({var[1]*100:.1f}%)" if len(var) > 1 else "PC2")
@@ -484,15 +488,18 @@ def visualize_activations(
     # ── t-SNE (optional) ─────────────────────────────────────────
     if tsne:
         from sklearn.manifold import TSNE
-        perp = min(30, max(5, N - 1))
+        N_min = min(len(a) for a in model_acts.values())
+        perp  = min(30, max(5, N_min - 1))
         tsne_proj = TSNE(n_components=2, perplexity=perp, random_state=0).fit_transform(all_acts)
         fig, ax = plt.subplots(figsize=(7, 5))
-        for label in ["Base", "Finetuned", "Unlearned"]:
-            mask = [i for i, l in enumerate(group_labels) if l == label]
-            ax.scatter(
-                tsne_proj[mask, 0], tsne_proj[mask, 1],
-                c=COLORS[label], label=label, alpha=0.7, edgecolors="none", s=40,
-            )
+        offset = 0
+        for name, acts in model_acts.items():
+            n = len(acts)
+            p = tsne_proj[offset : offset + n]
+            offset += n
+            ax.scatter(p[:, 0], p[:, 1],
+                       c=color_map[name], label=name,
+                       alpha=0.7, edgecolors="none", s=40)
         ax.set_title("Activation Space — t-SNE Projection")
         ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3)
@@ -547,24 +554,24 @@ def _mean_rouge(rouge_list: List[Dict]) -> Dict:
     return {k: float(np.mean([r[k] for r in rouge_list])) for k in keys}
 
 
+def _col(name: str, metric: str) -> str:
+    """CSV column name: {model_name}_{metric}, e.g. GradAscent_rouge1_r."""
+    return f"{name}_{metric}"
+
+
 def save_metrics(
-    rouge_base: List[Dict],
-    rouge_ft:   List[Dict],
-    rouge_ul:   List[Dict],
+    model_rouge: Dict[str, List[Dict]],
+    model_gen:   Dict[str, List[str]],
     distance_dict: Dict,
     samples: List[Dict],
-    gen_base: List[str],
-    gen_ft:   List[str],
-    gen_ul:   List[str],
     out_dir: Path,
 ) -> None:
+    names = list(model_rouge.keys())
+    rouge_keys = list(next(iter(model_rouge.values()))[0].keys()) if model_rouge else []
+
     # ── metrics_summary.json ──────────────────────────────────────
     summary = {
-        "rouge": {
-            "base":      _mean_rouge(rouge_base),
-            "finetuned": _mean_rouge(rouge_ft),
-            "unlearned": _mean_rouge(rouge_ul),
-        },
+        "rouge":                {n: _mean_rouge(model_rouge[n]) for n in names},
         "activation_distances": distance_dict,
     }
     summary_path = out_dir / "metrics_summary.json"
@@ -573,35 +580,63 @@ def save_metrics(
     print(f"Saved: {summary_path}")
 
     # ── rouge_scores.csv ─────────────────────────────────────────
-    rouge_keys = list(rouge_base[0].keys()) if rouge_base else []
     csv_path = out_dir / "rouge_scores.csv"
+    fieldnames = (
+        ["idx", "question", "answer"]
+        + [_col(n, k) for n in names for k in rouge_keys]
+        + [f"{n}_gen" for n in names]
+    )
     with open(csv_path, "w", newline="") as f:
-        fieldnames = (
-            ["idx", "question", "answer"]
-            + [f"base_{k}"      for k in rouge_keys]
-            + [f"finetuned_{k}" for k in rouge_keys]
-            + [f"unlearned_{k}" for k in rouge_keys]
-            + ["base_gen", "finetuned_gen", "unlearned_gen"]
-        )
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for i, (s, rb, rf, ru, gb, gf, gu) in enumerate(
-            zip(samples, rouge_base, rouge_ft, rouge_ul, gen_base, gen_ft, gen_ul)
-        ):
-            row = {
+        n_rows = len(samples)
+        for i in range(n_rows):
+            row: Dict = {
                 "idx":      i,
-                "question": s["question"],
-                "answer":   s["answer"],
-                "base_gen": gb,
-                "finetuned_gen": gf,
-                "unlearned_gen": gu,
+                "question": samples[i]["question"],
+                "answer":   samples[i]["answer"],
             }
-            for k in rouge_keys:
-                row[f"base_{k}"]      = rb[k]
-                row[f"finetuned_{k}"] = rf[k]
-                row[f"unlearned_{k}"] = ru[k]
+            for name in names:
+                for k in rouge_keys:
+                    row[_col(name, k)] = model_rouge[name][i][k]
+                row[f"{name}_gen"] = model_gen[name][i] if model_gen.get(name) else ""
             writer.writerow(row)
     print(f"Saved: {csv_path}")
+
+
+def load_rouge_from_csv(
+    csv_path: Path,
+    names: List[str],
+) -> Optional[Dict[str, List[Dict]]]:
+    """Load per-model ROUGE lists from an existing rouge_scores.csv.
+
+    Returns None if the CSV is missing or doesn't contain columns for all names.
+    """
+    if not csv_path.exists():
+        return None
+    import csv as csv_mod
+    with open(csv_path, newline="") as f:
+        reader = csv_mod.DictReader(f)
+        rows = list(reader)
+    if not rows:
+        return None
+
+    rouge_keys = ["rouge1_r", "rouge1_f1", "rouge2_r", "rouge2_f1", "rougeL_r", "rougeL_f1"]
+    result: Dict[str, List[Dict]] = {}
+    for name in names:
+        # Accept both "{name}_{metric}" (new) and legacy prefixes for Base/Finetuned/Unlearned.
+        legacy = {"Base": "base", "Finetuned": "finetuned", "Unlearned": "unlearned"}
+        prefix = legacy.get(name, name)
+        col0 = f"{prefix}_{rouge_keys[0]}"
+        if col0 not in rows[0]:
+            print(f"  [rouge_scores.csv] No columns for '{name}' — will regenerate.")
+            return None
+        result[name] = [
+            {k: float(row[f"{prefix}_{k}"]) for k in rouge_keys}
+            for row in rows
+        ]
+    print(f"  Loaded ROUGE scores from {csv_path}  (skipping generation).")
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -614,7 +649,12 @@ def parse_args():
     )
     parser.add_argument("--base_model",      required=True, help="Path or HF ID of the base model.")
     parser.add_argument("--finetuned_model", required=True, help="Path to finetuned model checkpoint.")
-    parser.add_argument("--unlearned_model", required=True, help="Path to unlearned model checkpoint.")
+    # Legacy single-method argument (kept for backward compatibility).
+    parser.add_argument("--unlearned_model", default=None, help="Path to unlearned model checkpoint.")
+    # Multi-method: one or more 'Name:path' pairs (e.g. RMU:saves/unlearn/... SimNPO:saves/unlearn/...)
+    parser.add_argument("--methods", nargs="+", default=[],
+                        metavar="NAME:PATH",
+                        help="Additional unlearned models as name:path pairs.")
     parser.add_argument("--forget_data",     default=None,
                         help="JSON file with forget samples or TOFU split name (default: forget10).")
     parser.add_argument("--output_dir",      default="analysis_out", help="Directory to save results.")
@@ -663,21 +703,43 @@ def main():
     for _, _, gts in batches:
         all_ground_truths.extend(gts)
 
-    # ── Run models ────────────────────────────────────────────────────────
+    # ── Build model list ──────────────────────────────────────────────────
     model_configs = [
         ("Base",      args.base_model),
         ("Finetuned", args.finetuned_model),
-        ("Unlearned", args.unlearned_model),
     ]
+    # Legacy --unlearned_model
+    if args.unlearned_model:
+        model_configs.append(("Unlearned", args.unlearned_model))
+    # --methods NAME:path ...
+    for item in args.methods:
+        name, path = item.split(":", 1)
+        model_configs.append((name, path))
 
+    if len(model_configs) < 3:
+        print("Provide at least one unlearned model via --unlearned_model or --methods.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # ── Check for existing ROUGE CSV (skip generation if present) ────────
+    all_names  = [name for name, _ in model_configs]
+    csv_path   = out_dir / "rouge_scores.csv"
+    cached_rouge = load_rouge_from_csv(csv_path, all_names)
+
+    # ── Run models ────────────────────────────────────────────────────────
     results = {}
     for name, path in model_configs:
         print(f"\n{'='*60}\n[{name}] {path}\n{'='*60}")
         model, tokenizer = load_model(path, args.device, dtype)
 
-        gen_texts    = generate_outputs(model, tokenizer, batches, args.max_new_tokens)
-        rouge_scores = compute_rouge(gen_texts, all_ground_truths)
-        acts         = extract_activations(model, batches, args.layer)
+        if cached_rouge is not None:
+            rouge_scores = cached_rouge[name]
+            gen_texts    = []
+        else:
+            gen_texts    = generate_outputs(model, tokenizer, batches, args.max_new_tokens)
+            rouge_scores = compute_rouge(gen_texts, all_ground_truths)
+
+        acts = extract_activations(model, batches, args.layer)
 
         results[name] = {
             "gen":   gen_texts,
@@ -689,58 +751,39 @@ def main():
         if args.device == "cuda":
             torch.cuda.empty_cache()
 
+    # Use the first unlearned model for the 3-way distance table (backward compat).
+    ul_name = model_configs[2][0]
+
     # ── Distances ─────────────────────────────────────────────────────────
     print("\nComputing pairwise activation distances …")
     distance_dict = compute_all_distances(
         results["Base"]["acts"],
         results["Finetuned"]["acts"],
-        results["Unlearned"]["acts"],
+        results[ul_name]["acts"],
     )
 
-    # ── Save metrics ──────────────────────────────────────────────────────
-    save_metrics(
-        rouge_base = results["Base"]["rouge"],
-        rouge_ft   = results["Finetuned"]["rouge"],
-        rouge_ul   = results["Unlearned"]["rouge"],
-        distance_dict = distance_dict,
-        samples    = samples,
-        gen_base   = results["Base"]["gen"],
-        gen_ft     = results["Finetuned"]["gen"],
-        gen_ul     = results["Unlearned"]["gen"],
-        out_dir    = out_dir,
-    )
+    # ── Save metrics (only if we ran generation) ──────────────────────────
+    model_rouge = {name: results[name]["rouge"] for name, _ in model_configs}
+    if cached_rouge is None:
+        model_gen = {name: results[name]["gen"] for name, _ in model_configs}
+        save_metrics(model_rouge, model_gen, distance_dict, samples, out_dir)
 
     # ── Visualise ─────────────────────────────────────────────────────────
     print("\nGenerating plots …")
-    visualize_rouge(
-        results["Base"]["rouge"],
-        results["Finetuned"]["rouge"],
-        results["Unlearned"]["rouge"],
-        out_dir,
-    )
-    visualize_rouge_histograms(
-        results["Base"]["rouge"],
-        results["Finetuned"]["rouge"],
-        results["Unlearned"]["rouge"],
-        out_dir,
-    )
-    visualize_activations(
-        results["Base"]["acts"],
-        results["Finetuned"]["acts"],
-        results["Unlearned"]["acts"],
-        out_dir,
-        tsne=args.tsne,
-    )
+    visualize_rouge(model_rouge, out_dir)
+    visualize_rouge_histograms(model_rouge, out_dir)
+    model_acts = {name: results[name]["acts"] for name, _ in model_configs}
+    visualize_activations(model_acts, out_dir, tsne=args.tsne)
     visualize_distances(distance_dict, out_dir)
 
     # ── Print summary ─────────────────────────────────────────────────────
     print("\n" + "="*60)
     print("SUMMARY")
     print("="*60)
-    for model_name in ["Base", "Finetuned", "Unlearned"]:
-        mean = _mean_rouge(results[model_name]["rouge"])
+    for name, _ in model_configs:
+        mean = _mean_rouge(results[name]["rouge"])
         print(
-            f"  {model_name:12s} | "
+            f"  {name:14s} | "
             f"ROUGE-1r={mean.get('rouge1_r', 0):.3f}  "
             f"ROUGE-2r={mean.get('rouge2_r', 0):.3f}  "
             f"ROUGE-Lf={mean.get('rougeL_f1', 0):.3f}"

@@ -1,0 +1,47 @@
+{
+  "Finetuned": {
+    "forget_cosine_dist_to_retrained": 0.02303391695022583,
+    "forget_l2_dist_to_retrained": 0.522748589515686,
+    "forget_centroid_cosine_to_retrained": 0.01945263147354126,
+    "retain_cosine_dist_to_retrained": 0.012538045644760132,
+    "retain_l2_dist_to_retrained": 0.3860858678817749,
+    "retain_centroid_cosine_to_retrained": 0.008609652519226074,
+    "forget_retain_centroid_gap": 0.19013023376464844
+  },
+  "Retrained": {
+    "forget_cosine_dist_to_retrained": -4.6193599700927734e-07,
+    "forget_l2_dist_to_retrained": 0.0,
+    "forget_centroid_cosine_to_retrained": 5.960464477539063e-08,
+    "retain_cosine_dist_to_retrained": -3.725290298461914e-07,
+    "retain_l2_dist_to_retrained": 0.0,
+    "retain_centroid_cosine_to_retrained": 5.960464477539063e-08,
+    "forget_retain_centroid_gap": 0.18796908855438232
+  },
+  "RMU": {
+    "forget_cosine_dist_to_retrained": 0.4515666961669922,
+    "forget_l2_dist_to_retrained": 2.0527114868164062,
+    "forget_centroid_cosine_to_retrained": 0.42334556579589844,
+    "retain_cosine_dist_to_retrained": 0.07238443940877914,
+    "retain_l2_dist_to_retrained": 0.9249526262283325,
+    "retain_centroid_cosine_to_retrained": 0.06147807836532593,
+    "forget_retain_centroid_gap": 0.3064357042312622
+  },
+  "SimNPO": {
+    "forget_cosine_dist_to_retrained": 0.021063990890979767,
+    "forget_l2_dist_to_retrained": 0.5014880895614624,
+    "forget_centroid_cosine_to_retrained": 0.018217921257019043,
+    "retain_cosine_dist_to_retrained": 0.01375909149646759,
+    "retain_l2_dist_to_retrained": 0.40459293127059937,
+    "retain_centroid_cosine_to_retrained": 0.009703755378723145,
+    "forget_retain_centroid_gap": 0.19015181064605713
+  },
+  "LatentRMU": {
+    "forget_cosine_dist_to_retrained": 0.0247795507311821,
+    "forget_l2_dist_to_retrained": 0.5527001619338989,
+    "forget_centroid_cosine_to_retrained": 0.02250683307647705,
+    "retain_cosine_dist_to_retrained": 0.015265628695487976,
+    "retain_l2_dist_to_retrained": 0.4370354413986206,
+    "retain_centroid_cosine_to_retrained": 0.011812865734100342,
+    "forget_retain_centroid_gap": 0.18282365798950195
+  }
+}
