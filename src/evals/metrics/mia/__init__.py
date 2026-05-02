@@ -2,6 +2,7 @@
 Attack implementations.
 """
 
+import torch
 from transformers import AutoModelForCausalLM
 
 from evals.metrics.base import unlearning_metric
@@ -90,6 +91,25 @@ def mia_reference(model, **kwargs):
         torch_dtype=model.dtype,
         device_map={"": model.device},
     )
+    # Guard against vocab mismatch: feeding tokens with IDs beyond the reference
+    # model's vocab triggers an async CUDA indexSelect assert in the embedding
+    # layer (e.g. Llama-3.2 vocab 128k tokens routed into a Llama-2 7B reference
+    # with vocab 32k). Skip with a warning so the rest of the eval suite still
+    # completes; user can supply a compatible reference_model_path to enable it.
+    model_vocab = getattr(getattr(model, "config", None), "vocab_size", None)
+    ref_vocab = getattr(reference_model.config, "vocab_size", None)
+    if model_vocab is not None and ref_vocab is not None and ref_vocab < model_vocab:
+        logger.warning(
+            f"Skipping mia_reference: reference model vocab_size={ref_vocab} is "
+            f"smaller than target model vocab_size={model_vocab}. The reference "
+            f"checkpoint at '{kwargs['reference_model_path']}' is incompatible "
+            f"with this tokenizer; pass a same-architecture reference via "
+            f"`reference_model_path` or drop mia_reference from the eval list."
+        )
+        del reference_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return {"auc": float("nan"), "agg_value": float("nan"), "skipped": True}
     return mia_auc(
         ReferenceAttack,
         model,

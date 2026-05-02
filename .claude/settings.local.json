@@ -112,7 +112,20 @@
       "Bash(/usr/bin/python3.10 -c \"import jupyter\")",
       "Bash(/usr/bin/python3.9 -c \"import matplotlib; print\\(matplotlib.__version__\\)\")",
       "Bash(env)",
-      "Bash(huggingface-cli whoami *)"
+      "Bash(huggingface-cli whoami *)",
+      "Bash(xxd)",
+      "Bash(git lfs *)",
+      "Bash(git -C /tank/home/judy/walla-code/open-unlearning-dev log --oneline -- phi_3_5.tar.zst)",
+      "Bash(zstd -dc /tank/home/judy/walla-code/open-unlearning-dev/phi_3_5.tar.zst)",
+      "Bash(zstd -t /tank/home/judy/walla-code/open-unlearning-dev/phi_3_5.tar.zst)",
+      "Bash(awk 'END{print}' /tank/home/judy/.claude/projects/-tank-home-judy-walla-code-open-unlearning-dev/f46d5026-b9f4-48d5-b714-331d62614b93/tool-results/bn7s2eve1.txt)",
+      "Bash(bash -n /tank/home/judy/walla-code/open-unlearning-dev/scripts/muse_finetune_1b.sh)",
+      "Bash(bash -n /tank/home/judy/walla-code/open-unlearning-dev/scripts/muse_finetune_1b_wakka.sh)",
+      "Bash(bash -n /tank/home/judy/walla-code/open-unlearning-dev/scripts/reeval_full_privacy.sh)",
+      "Bash(DRY_RUN=1 bash /tank/home/judy/walla-code/open-unlearning-dev/scripts/reeval_full_privacy.sh)",
+      "Bash(GPU=0 bash /tank/home/judy/walla-code/open-unlearning-dev/scripts/reeval_full_privacy.sh)",
+      "Bash(git -C /tank/home/judy/walla-code/open-unlearning-dev diff --stat src/trainer/unlearn/rmu_encoder_parallel.py)",
+      "Bash(bash -n /tank/home/judy/walla-code/open-unlearning-dev/scripts/tofu_unlearn.sh)"
     ],
     "additionalDirectories": [
       "/home/judy/code/open-unlearning-dev/scripts",

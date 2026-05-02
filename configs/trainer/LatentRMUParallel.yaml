@@ -1,7 +1,7 @@
 defaults:
   - GradDiff
 
-handler: LatentRMU
+handler: LatentRMUParallel
 
 args:
   learning_rate: 1e-5
@@ -18,14 +18,15 @@ method_args:
   # Encoder / Phase 1
   latent_dim: 256
   encoder_layers: 2
-  encoder_epochs: 2
+  encoder_epochs: 0
   encoder_lr: 1e-3
-  orth_weight: 1.0
-  anchor_weight: 1.0
+
+  # Phase 2 warmup: linearly ramp forget loss from 0→1 over N steps (0 = off)
+  forget_warmup_steps: 0
 
   # Phase 2 (RMU unlearning)
   steering_coeff: 20
-  forget_warmup_steps: 0
+  orth_weight: 1.0
 
   # Inherited from GradDiff / RMU
   gamma: 1.0

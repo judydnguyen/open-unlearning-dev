@@ -1,0 +1,10 @@
+defaults:
+  - LatentRMUParallelDDP
+
+# Hook layer 7 (early-mid) with trainable layers 5-8.
+# Contrast with LatentRMUParallelDDP (layer 16) and LatentRMUParallelDDP_late (layer 24).
+
+method_args:
+  module_regex: "model\\.layers\\.7"
+  trainable_params_regex:
+    - "model\\.layers\\.(5|6|7|8)\\.mlp\\.down_proj\\.weight"

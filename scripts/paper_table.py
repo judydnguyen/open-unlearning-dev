@@ -2,9 +2,10 @@
 """Collect TOFU_EVAL.json results for all paper methods and print a composite-score table.
 
 Metrics (all normalized by the Baseline / full finetuned model):
-  MemScore  = HM(1−ES_norm, 1−Para.Prob_norm, 1−TR_norm)   higher = more forgetting
+  MemScore  = HM(1−ES_norm, 1−TR_norm, 1−Q_A_Prob_norm)        higher = more forgetting
+              (3 orthogonal signals: extraction, truth-ratio, verbatim Q/A prob)
   Utility   = model_utility / model_utility_baseline          higher = better retention
-  Privacy   = sMIA score (1 = indistinguishable from retain) higher = better
+  Privacy   = max(0, 1 − privleak/100), asymmetric            higher = better
 
 Usage:
     python scripts/paper_table.py --model Llama-3.2-1B-Instruct \\
@@ -44,8 +45,17 @@ def get_agg(data, key):
     return float(entry)
 
 
-def compute_scores(eval_data, baseline_data, retain_mia_auc=None):
-    """Compute MemScore, Utility, Privacy relative to baseline_data."""
+MIA_KEYS = ("mia_loss", "mia_zlib", "mia_min_k", "mia_min_k_plus_plus")
+
+
+def compute_scores(eval_data, baseline_data, retain_data=None):
+    """Compute MemScore, Utility, Privacy relative to baseline_data.
+
+    Privacy = max(0, 1 − |avg-privleak|/100), averaged across the 4 MIA attacks
+    in MIA_KEYS. Per-MIA privleak = (AUC_retain − AUC_unlearn) / (1 − AUC_retain) × 100,
+    using the same convention as src/evals/metrics/privacy.py (stored = 1 − AUC).
+    Falls back to the single mia_min_k privleak field when only one MIA is present.
+    """
     def norm_higher(val, ref):
         if val is None or ref is None or ref <= 0:
             return None
@@ -62,18 +72,23 @@ def compute_scores(eval_data, baseline_data, retain_mia_auc=None):
             return None
         return min(sig / sig_ref, 1.0)
 
+    # MemScore = HM(1−ES_n, 1−TR_n, 1−Q_A_Prob_n), all normalized vs Baseline.
+    # PP (paraphrase prob) and EM (exact_memorization) are intentionally excluded:
+    #   - PP overlaps with TR (both probe semantic memorization beyond verbatim).
+    #   - EM is missing from most flat-method evals; excluding it keeps the
+    #     comparison consistent without requiring an EM re-eval pass.
     es_norm = norm_higher(get_agg(eval_data, "extraction_strength"),
                           get_agg(baseline_data, "extraction_strength"))
-    pp_norm = norm_higher(get_agg(eval_data, "forget_Q_A_PARA_Prob"),
-                          get_agg(baseline_data, "forget_Q_A_PARA_Prob"))
+    qp_norm = norm_higher(get_agg(eval_data, "forget_Q_A_Prob"),
+                          get_agg(baseline_data, "forget_Q_A_Prob"))
     tr_norm = norm_tr(get_agg(eval_data, "forget_truth_ratio"),
                       get_agg(baseline_data, "forget_truth_ratio"))
 
     components = {}
     if es_norm is not None:
         components["es"] = 1.0 - es_norm
-    if pp_norm is not None:
-        components["pp"] = 1.0 - pp_norm
+    if qp_norm is not None:
+        components["qp"] = 1.0 - qp_norm
     if tr_norm is not None:
         components["tr"] = 1.0 - tr_norm
 
@@ -83,26 +98,48 @@ def compute_scores(eval_data, baseline_data, retain_mia_auc=None):
     mu_ref = get_agg(baseline_data, "model_utility")
     utility = min(mu / mu_ref, 1.0) if (mu is not None and mu_ref and mu_ref > 0) else None
 
-    mia_auc = get_agg(eval_data, "mia_min_k")
-    privleak = get_agg(eval_data, "privleak")
-    privacy = None
-    if mia_auc is not None and retain_mia_auc is not None:
-        denom = max(retain_mia_auc, 1.0 - retain_mia_auc)
-        privacy = max(0.0, 1.0 - abs(mia_auc - retain_mia_auc) / denom)
-    elif privleak is not None:
-        privacy = max(0.0, min(1.0, 1.0 + privleak / 100.0))
+    # Privacy: 1 − |avg-privleak|/100 averaged across 4 MIAs (LOSS/Zlib/Mink/Mink++).
+    # Symmetric — penalizes deviation from retrain in either direction. When the
+    # retain reference doesn't have all 4 MIAs (or eval_data lacks them), falls
+    # back to the single privleak field already in the eval JSON.
+    per_mia_pl = []
+    if retain_data is not None:
+        for k in MIA_KEYS:
+            s = get_agg(eval_data, k)
+            r = get_agg(retain_data, k)
+            if s is None or r is None:
+                continue
+            denom = 1.0 - r
+            if abs(denom) < 1e-9:
+                continue
+            per_mia_pl.append((r - s) / denom * 100.0)
+    if per_mia_pl:
+        avg_abs_pl = sum(abs(p) for p in per_mia_pl) / len(per_mia_pl)
+        avg_pl_signed = sum(per_mia_pl) / len(per_mia_pl)
+        privacy = max(0.0, min(1.0, 1.0 - avg_abs_pl / 100.0))
+    else:
+        # Fallback: single-MIA privleak from the eval JSON (mia_min_k-based)
+        single_pl = get_agg(eval_data, "privleak")
+        avg_pl_signed = single_pl
+        avg_abs_pl = abs(single_pl) if single_pl is not None else None
+        privacy = max(0.0, min(1.0, 1.0 - abs(single_pl) / 100.0)) if single_pl is not None else None
 
     return {
         "mem_score": mem_score,
         "utility": utility,
         "privacy": privacy,
         "n_components": len(components),
-        "components": {"es_norm": es_norm, "pp_norm": pp_norm, "tr_norm": tr_norm},
-        "raw": {"privleak": privleak, "mia_auc": mia_auc, "model_utility": mu},
+        "components": {"es_norm": es_norm, "qp_norm": qp_norm, "tr_norm": tr_norm},
+        "raw": {
+            "avg_privleak_signed": avg_pl_signed,
+            "avg_abs_privleak": avg_abs_pl,
+            "n_mias": len(per_mia_pl),
+            "model_utility": mu,
+        },
     }
 
 
-def find_best_checkpoint_eval(run_dir: Path, select_by="mem_score", baseline_data=None, retain_mia_auc=None):
+def find_best_checkpoint_eval(run_dir: Path, select_by="mem_score", baseline_data=None, retain_data=None):
     """Among checkpoint-*/evals/TOFU_EVAL.json, return (ckpt_num, eval_data, scores) for best."""
     pattern = str(run_dir / "checkpoint-*" / "evals" / "TOFU_EVAL.json")
     paths = glob.glob(pattern)
@@ -116,7 +153,7 @@ def find_best_checkpoint_eval(run_dir: Path, select_by="mem_score", baseline_dat
             continue
         ckpt = int(m.group(1))
         data = load_json(p)
-        scores = compute_scores(data, baseline_data, retain_mia_auc) if baseline_data else {}
+        scores = compute_scores(data, baseline_data, retain_data) if baseline_data else {}
         candidates.append((ckpt, data, scores))
 
     if not candidates:
@@ -163,20 +200,18 @@ def build_method_rows(model, our_pattern, saves_unlearn, saves_eval, verbose):
         retrained_path = Path(saves_eval) / f"tofu_{model}_{retain_split}" / "TOFU_EVAL.json"
         retrained_data = load_flat_eval(retrained_path)
 
-        retain_mia_auc = None
-        if retrained_data:
-            retain_mia_auc = get_agg(retrained_data, "mia_min_k")
+        retain_data = retrained_data  # full eval dict — used for per-MIA privleak
 
         # ── Baseline row ──────────────────────────────────────────────────────
         if baseline_data and baseline_data:
             # Baseline normalized against itself → all norms=1 → mem=0, utility=1
-            s = compute_scores(baseline_data, baseline_data, retain_mia_auc)
+            s = compute_scores(baseline_data, baseline_data, retain_data)
             rows.append({"method": "Baseline", "split": split, "data": baseline_data, "scores": s,
                          "ckpt": None, "path": str(baseline_path)})
 
         # ── Retrained row ─────────────────────────────────────────────────────
         if retrained_data and baseline_data:
-            s = compute_scores(retrained_data, baseline_data, retain_mia_auc)
+            s = compute_scores(retrained_data, baseline_data, retain_data)
             rows.append({"method": "Retrained", "split": split, "data": retrained_data, "scores": s,
                          "ckpt": None, "path": str(retrained_path)})
 
@@ -189,14 +224,14 @@ def build_method_rows(model, our_pattern, saves_unlearn, saves_eval, verbose):
                 rows.append({"method": method, "split": split, "data": None, "scores": {},
                              "ckpt": None, "path": str(eval_path)})
                 continue
-            s = compute_scores(data, baseline_data, retain_mia_auc) if baseline_data else {}
+            s = compute_scores(data, baseline_data, retain_data) if baseline_data else {}
             rows.append({"method": method, "split": split, "data": data, "scores": s,
                          "ckpt": None, "path": str(eval_path)})
 
         # ── Ours (LatentRMU, checkpoint-based) ───────────────────────────────
         our_task = our_pattern.replace("{model}", model).replace("{split}", split)
         our_dir = Path(saves_unlearn) / our_task
-        ckpt, our_data, our_scores = find_best_checkpoint_eval(our_dir, "mem_score", baseline_data, retain_mia_auc)
+        ckpt, our_data, our_scores = find_best_checkpoint_eval(our_dir, "mem_score", baseline_data, retain_data)
         rows.append({"method": "Ours", "split": split, "data": our_data,
                      "scores": our_scores or {}, "ckpt": ckpt, "path": str(our_dir)})
 
@@ -206,9 +241,9 @@ def build_method_rows(model, our_pattern, saves_unlearn, saves_eval, verbose):
 def print_table(rows, verbose):
     METHOD_ORDER = ["Baseline", "Retrained", "GradAscent", "GradDiff", "NPO", "RMU", "SimNPO", "Ours"]
 
-    header = f"{'Method':<14} {'Split':<10} {'MemScore':>9} {'Util%':>7} {'Privacy':>8}"
+    header = f"{'Method':<14} {'Split':<10} {'MemScore':>9} {'Util%':>7} {'Privacy':>8} {'#Comp':>6}"
     if verbose:
-        header += f"  {'ES_n':>6} {'PP_n':>6} {'TR_n':>6}  {'Ckpt':>6}"
+        header += f"  {'ES_n':>6} {'QP_n':>6} {'TR_n':>6}  {'Ckpt':>6}"
     print()
     print(header)
     print("─" * len(header))
@@ -231,11 +266,12 @@ def print_table(rows, verbose):
             ckpt = f"{match['ckpt']}" if match["ckpt"] is not None else "—"
             missing = match["data"] is None
 
-            line = f"{method:<14} {split:<10} {mem:>9} {util:>7} {priv:>8}"
+            n_comp = s.get("n_components", 0)
+            line = f"{method:<14} {split:<10} {mem:>9} {util:>7} {priv:>8} {n_comp:>6}"
             if verbose:
                 c = s.get("components", {})
                 line += (f"  {fmt(c.get('es_norm')):>6}"
-                         f" {fmt(c.get('pp_norm')):>6}"
+                         f" {fmt(c.get('qp_norm')):>6}"
                          f" {fmt(c.get('tr_norm')):>6}"
                          f"  {ckpt:>6}")
             if missing:

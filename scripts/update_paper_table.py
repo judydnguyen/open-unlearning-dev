@@ -117,9 +117,6 @@ def collect_split_data(split):
     return results
 
 
-def fmt_fq(v):
-    return f"{v:.4f}" if v is not None else "---"
-
 def fmt_mu(v):
     return f"{v * 100:.2f}" if v is not None else "---"
 
@@ -130,15 +127,14 @@ def fmt_es(v):
     return f"{v:.4f}" if v is not None else "---"
 
 
-def make_cell(data, force_fq=None):
-    """Return (FQ, MU, PL, ES) formatted strings for one method+split."""
+def make_cell(data):
+    """Return (MU, PL, ES) formatted strings for one method+split."""
     if data is None:
-        return "---", "---", "---", "---"
-    fq = force_fq if force_fq is not None else get_agg(data, "forget_quality")
+        return "---", "---", "---"
     mu = get_agg(data, "model_utility")
     pl = get_agg(data, "privleak")
     es = get_agg(data, "extraction_strength")
-    return fmt_fq(fq), fmt_mu(mu), fmt_pl(pl), fmt_es(es)
+    return fmt_mu(mu), fmt_pl(pl), fmt_es(es)
 
 
 def generate_rows():
@@ -158,9 +154,7 @@ def generate_rows():
         cells = []
         for split in SPLITS:
             data = split_data[split].get(key) if key else None
-            # Retrain FQ is 1.0 by definition (oracle gold standard)
-            force_fq = 1.0 if key == "retrained" else None
-            cells.extend(make_cell(data, force_fq=force_fq))
+            cells.extend(make_cell(data))
 
         row = f"  {label_str} & " + " & ".join(cells) + " \\\\"
         lines.append(row)

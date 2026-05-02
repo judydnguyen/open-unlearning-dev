@@ -1,0 +1,51 @@
+defaults:
+  - GradDiff
+
+# Stronger-forgetting variant of LatentRMUParallelDDP.
+# Motivation: Books verbmem=0.997 with the base config — deeply memorized content
+# requires a larger edit surface and stronger forget pressure to deflect greedy
+# decoding away from the memorized path.
+#
+# Changes vs LatentRMUParallelDDP:
+#   - trainable_params_regex: layers 14-17 → layers 10-20 (~3x edit surface,
+#     capped at module_regex layer because EMBED_DIFF can't grad past it)
+#   - module_regex: layer 16 → layer 20 (later = more direct output influence)
+#   - gamma: 8 → 20
+#   - steering_coeff: 40 → 60
+#   - alpha: 0.5 → 0.3 (less retain pressure to allow deeper forgetting)
+# Memory: ~11 MLP down_proj layers × ~350 MB optimizer state ≈ 3.9 GB, fits 44 GB GPU.
+
+handler: LatentRMUParallel
+
+args:
+  learning_rate: 2e-4
+  num_train_epochs: 10
+
+method_args:
+  # Hook later layer — layer 20 has more direct influence on output token probs
+  # than layer 16, more effective at disrupting verbatim memorization.
+  module_regex: "model\\.layers\\.20"
+
+  # Trainable layers must be ≤ module_regex layer: with retain_loss_type=EMBED_DIFF
+  # both forget_loss and retain_loss read the hidden state at layer 20, so anything
+  # downstream (21+) gets no gradient. DDP find_unused_parameters can't ignore them
+  # because full forward still reaches them, and it deadlocks waiting on their grads.
+  trainable_params_regex:
+    - "model\\.layers\\.(10|11|12|13|14|15|16|17|18|19|20)\\.mlp\\.down_proj\\.weight"
+
+  # Encoder / Phase 1
+  latent_dim: 256
+  encoder_layers: 2
+  encoder_epochs: 2
+  encoder_lr: 1e-3
+
+  # Phase 2 warmup
+  forget_warmup_steps: 100
+
+  # Phase 2 — stronger forget pressure
+  steering_coeff: 60
+  orth_weight: 1.0
+
+  gamma: 20.0
+  alpha: 0.3
+  retain_loss_type: EMBED_DIFF

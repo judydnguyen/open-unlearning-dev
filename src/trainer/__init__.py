@@ -1,6 +1,6 @@
 import torch
 from typing import Dict, Any
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from transformers import Trainer, TrainingArguments
 
 from trainer.base import FinetuneTrainer
@@ -23,7 +23,8 @@ from trainer.unlearn.SteerGRPO import SteerGRPO
 from trainer.unlearn.SteerGRPOSimple import SteerGRPOSimple
 from trainer.unlearn.PurgeGRPO import PurgeGRPO
 from trainer.unlearn.SteerGRPO_multiGPU import SteerGRPOMultiGPU
-from trainer.unlearn.rmu_encoder_parallel import LatentRMU
+from trainer.unlearn.rmu_encoder import LatentRMU
+from trainer.unlearn.rmu_encoder_parallel import LatentRMUParallel
 
 
 import logging
@@ -38,7 +39,7 @@ def _register_trainer(trainer_class):
 
 
 def load_trainer_args(trainer_args: DictConfig, dataset):
-    trainer_args = dict(trainer_args)
+    trainer_args = OmegaConf.to_container(trainer_args, resolve=True)
     warmup_epochs = trainer_args.pop("warmup_epochs", None)
     if warmup_epochs:
         batch_size = trainer_args["per_device_train_batch_size"]
@@ -134,3 +135,6 @@ _register_trainer(SteerGRPOSimple)
 _register_trainer(SteerGRPOMultiGPU)
 _register_trainer(PurgeGRPO)
 _register_trainer(LatentRMU)
+
+# rmu_encoder_parallel: same algorithm with DDP/_sync_encoder_weights support
+_register_trainer(LatentRMUParallel)

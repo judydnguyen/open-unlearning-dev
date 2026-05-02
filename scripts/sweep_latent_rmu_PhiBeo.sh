@@ -1,19 +1,24 @@
 #!/bin/bash
 
-# Sweep script for LatentRMU on Llama-3.2-3B-Instruct across three TOFU forget splits.
+# Sweep script for LatentRMU on Phi-3.5-mini-instruct across three TOFU forget splits.
 # Each scenario uses the per-split hyperparameters from test_latent_rmu.sh.
 #
 # Scenario 1 (forget01): small forget set — smaller batch, fewer warmup steps
 # Scenario 2 (forget05): medium forget set
 # Scenario 3 (forget10): large forget set
+#
+# Phi-3.5-mini has 32 layers / hidden_size 3072. We hook layer 7 (same depth idx
+# as the Llama sweeps) — bump the module_regex if you want a deeper hook.
 
 set -e
 
 export MASTER_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
 echo "Master Port: $MASTER_PORT"
 
-MODEL="Llama-3.2-3B-Instruct"
-MODEL_PATH="open-unlearning/tofu_${MODEL}_full"
+MODEL="Phi-3.5-mini-instruct"
+# Local TOFU-finetuned checkpoint (no public open-unlearning HF mirror for this model).
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MODEL_PATH="${PROJECT_ROOT}/saves/finetune/tofu_${MODEL}_full/last"
 GPUS="1"
 
 run_scenario() {
@@ -23,7 +28,7 @@ run_scenario() {
     local BATCH=$4
     local WARMUP=$5
 
-    local TASK_NAME=tofu_${MODEL}_${FORGET_SPLIT}_LatentRMU_v4.8_sweep_01_coeff_10
+    local TASK_NAME=tofu_${MODEL}_${FORGET_SPLIT}_LatentRMU_v4.8_sweep
 
     echo "=========================================="
     echo "Running LatentRMU: ${FORGET_SPLIT} / ${RETAIN_SPLIT}"
@@ -48,9 +53,10 @@ run_scenario() {
         trainer.args.save_strategy=no \
         trainer.method_args.module_regex="model\.layers\.7" \
         trainer.method_args.encoder_epochs=6 \
-        trainer.method_args.steering_coeff=10 \
+        trainer.method_args.steering_coeff=5 \
         trainer.method_args.latent_dim=256 \
         trainer.method_args.orth_weight=2.0 \
+        trainer.method_args.anchor_weight=1.0 \
         trainer.method_args.forget_warmup_steps=${WARMUP} \
         trainer.method_args.gamma=1.0 \
         trainer.method_args.alpha=2.0 \
@@ -64,10 +70,10 @@ run_scenario() {
 # Scenario 1: forget01 — batch=2, warmup=10
 run_scenario forget01 retain99 holdout01 2 10
 
-# # Scenario 2: forget05 — batch=8, warmup=30
-run_scenario forget05 retain95 holdout05 4 30
+# Scenario 2: forget05 — batch=8, warmup=30
+run_scenario forget05 retain95 holdout05 8 30
 
-# # Scenario 3: forget10 — batch=8, warmup=30
+# Scenario 3: forget10 — batch=8, warmup=30
 run_scenario forget10 retain90 holdout10 8 30
 
 echo "=========================================="

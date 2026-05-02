@@ -1,0 +1,10 @@
+defaults:
+  - LatentRMUParallelDDP
+
+# Extends LatentRMUParallelDDP by training all three MLP projections
+# (gate_proj, up_proj, down_proj) at layers 14-17 instead of down_proj only.
+# More capacity to steer layer 16 activations; optimizer states ~4 GB vs ~1.4 GB.
+
+method_args:
+  trainable_params_regex:
+    - "model\\.layers\\.(14|15|16|17)\\.mlp\\.(down_proj|gate_proj|up_proj)\\.weight"

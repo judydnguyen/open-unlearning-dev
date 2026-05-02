@@ -80,9 +80,10 @@ def _refresh_metrics_plot(run_dir: str) -> None:
 
 
 class FinetuneTrainer(Trainer):
-    def __init__(self, evaluators=None, template_args=None, *args, **kwargs):
+    def __init__(self, evaluators=None, template_args=None, save_checkpoint_at_eval=False, *args, **kwargs):
         self.evaluators = evaluators
         self.template_args = template_args
+        self.save_checkpoint_at_eval = save_checkpoint_at_eval
         self._best_forget_quality = -float("inf")
         self._custom_eval_skipped_warned = False
         super().__init__(*args, **kwargs)
@@ -124,6 +125,13 @@ class FinetuneTrainer(Trainer):
                     eval_metrics.update(evaluator.evaluate(**eval_args))
                 self.log(eval_metrics)
                 _refresh_metrics_plot(run_dir)
+                if self.save_checkpoint_at_eval:
+                    ckpt_model_dir = os.path.join(run_dir, checkpoint_folder)
+                    self.save_model(ckpt_model_dir)
+                    logger.info(
+                        "Saved model checkpoint at step %d → %s",
+                        self.state.global_step, ckpt_model_dir,
+                    )
                 mu = eval_metrics.get("model_utility")
                 ner = eval_metrics.get("forget_Q_A_NER")
                 if mu is not None and ner is not None:

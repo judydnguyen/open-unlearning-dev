@@ -13,10 +13,10 @@ defaults: # include all defined metrics files
     - extraction_strength
     - forget_Q_A_NER
     - exact_memorization
-    # - mia_min_k_plus_plus
-    # - mia_min_k
-    # - mia_loss
-    # - mia_zlib
+    - mia_min_k_plus_plus
+    - mia_min_k
+    - mia_loss
+    - mia_zlib
     # - mia_gradnorm
     # - mia_reference # set reference model path appropriately
     # - forget_Q_A_gibberish

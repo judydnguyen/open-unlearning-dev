@@ -186,3 +186,9 @@ saves/
 *_output/
 
 **/.acts_cache/
+
+69dbd368906584c40e4aa4e8/
+*.tar*
+*.bak
+
+.claude/

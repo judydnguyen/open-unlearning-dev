@@ -1,0 +1,44 @@
+defaults:
+  - GradDiff
+
+# Milder variant of LatentRMUParallelDDP_strong.
+# Motivation: v1 over-unlearned on News — retain_knowmem_ROUGE collapsed from
+# gold 0.56 to 0.12 (ckpt-612, ~epoch 6) to 0.00 (last). privleak hit −79 vs
+# gold −4.7. The v1 forget=0 result is the model failing on everything, not
+# successful unlearning. Dial back forget pressure on three axes at once:
+#
+# Changes vs LatentRMUParallelDDP_strong:
+#   - steering_coeff: 60 → 30 (halve the activation-displacement target)
+#   - gamma: 20 → 10 (halve the forget loss weight)
+#   - alpha: 0.3 → 0.7 (>2× more retain pressure)
+# Unchanged: edit surface (layers 10-20), module_regex (layer 20),
+# learning_rate (2e-4), num_train_epochs (10), encoder phase.
+
+handler: LatentRMUParallel
+
+args:
+  learning_rate: 2e-4
+  num_train_epochs: 10
+
+method_args:
+  module_regex: "model\\.layers\\.20"
+
+  trainable_params_regex:
+    - "model\\.layers\\.(10|11|12|13|14|15|16|17|18|19|20)\\.mlp\\.down_proj\\.weight"
+
+  # Encoder / Phase 1
+  latent_dim: 256
+  encoder_layers: 2
+  encoder_epochs: 2
+  encoder_lr: 1e-3
+
+  # Phase 2 warmup
+  forget_warmup_steps: 100
+
+  # Phase 2 — milder forget pressure
+  steering_coeff: 60
+  orth_weight: 1.0
+
+  gamma: 10.0
+  alpha: 0.7
+  retain_loss_type: EMBED_DIFF

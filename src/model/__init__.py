@@ -59,11 +59,29 @@ def get_model(model_cfg: DictConfig):
     model_cls = MODEL_REGISTRY[model_handler]
     with open_dict(model_args):
         model_path = model_args.pop("pretrained_model_name_or_path", None)
+        load_in_4bit = model_args.pop("load_in_4bit", False)
+        load_in_8bit = model_args.pop("load_in_8bit", False)
     model_path = _resolve_local_path(model_path)
+
+    quantization_config = None
+    if load_in_4bit:
+        from transformers import BitsAndBytesConfig
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+        )
+        torch_dtype = None
+    elif load_in_8bit:
+        from transformers import BitsAndBytesConfig
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+        torch_dtype = None
+
     try:
         model = model_cls.from_pretrained(
             pretrained_model_name_or_path=model_path,
             torch_dtype=torch_dtype,
+            quantization_config=quantization_config,
             **model_args,
         )
     except Exception as e:

@@ -1,0 +1,47 @@
+defaults:
+  - GradDiff
+
+# DDP-compatible variant of LatentRMUParallel.
+# LatentRMUParallel.yaml sets trainable_params_regex: ".*" (all params) which
+# is fine under ZeRO Stage 3 (optimizer states are partitioned across GPUs) but
+# requires ~56 GB of AdamW fp32 states per GPU under plain DDP.
+# This config restricts Phase 2 training to a small set of MLP layers so the
+# optimizer state fits comfortably in a 44 GB GPU alongside the frozen ref model.
+# For full-model Phase 2 training, use LatentRMUParallel with ZeRO Stage 3.
+
+handler: LatentRMUParallel
+
+args:
+  learning_rate: 2e-4
+  num_train_epochs: 10
+
+method_args:
+  # Layer to hook activations from (mid-model for Llama-2-7b, 32 layers)
+  module_regex: "model\\.layers\\.16"
+
+  # Params to update during Phase 2 — restrict to a few MLP layers so AdamW
+  # optimizer states (~1.4 GB) fit alongside the 13.5 GB model + 13.5 GB ref.
+  # Layers 14-17 cover the mid-to-upper range where factual knowledge is stored.
+  trainable_params_regex:
+    - "model\\.layers\\.(14|15|16|17)\\.mlp\\.down_proj\\.weight"
+
+  # Encoder / Phase 1
+  latent_dim: 256
+  encoder_layers: 2
+  encoder_epochs: 2
+  encoder_lr: 1e-3
+
+  # Phase 2 warmup: ramp forget loss from 0→1 over first N steps so the retain
+  # loss can stabilise before full forget pressure kicks in (Variant B).
+  forget_warmup_steps: 100
+
+  # Phase 2 (RMU unlearning)
+  # gamma=8 balances forget/retain gradients: retain_loss≈0.7 vs forget_loss≈sc²/H≈0.09
+  # alpha=0.5 chosen from sweep (g8_sc40_a05 best Pareto on MUSE-News).
+  steering_coeff: 40
+  orth_weight: 1.0
+
+  # Inherited from GradDiff / RMU
+  gamma: 8.0
+  alpha: 0.5
+  retain_loss_type: EMBED_DIFF
