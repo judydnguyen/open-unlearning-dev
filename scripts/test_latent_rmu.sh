@@ -52,7 +52,7 @@ run_scenario() {
         trainer.args.save_strategy=no \
         trainer.method_args.module_regex="model\.layers\.7" \
         trainer.method_args.encoder_epochs=6 \
-        trainer.method_args.steering_coeff=7 \
+        trainer.method_args.steering_coeff=8 \
         trainer.method_args.latent_dim=256 \
         trainer.method_args.orth_weight=2.0 \
         trainer.method_args.forget_warmup_steps=${WARMUP} \
@@ -66,13 +66,13 @@ run_scenario() {
 }
 
 # Scenario 1: forget01 — batch=2, warmup=10
-run_scenario forget01 retain99 holdout01 4 10
+# run_scenario forget01 retain99 holdout01 4 10
 
 # # Scenario 2: forget05 — batch=8, warmup=30
-# run_scenario forget05 retain95 holdout05 4 30
+# run_scenario forget05 retain95 holdout05 8 30
 
 # # Scenario 3: forget10 — batch=8, warmup=30
-# run_scenario forget10 retain90 holdout10 8 30
+run_scenario forget10 retain90 holdout10 16 30
 
 echo "=========================================="
 echo "All three scenarios completed."

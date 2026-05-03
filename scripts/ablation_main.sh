@@ -1,0 +1,201 @@
+#!/bin/bash
+# Tier 1 ablation for FLOUR on forget05.
+#
+# Three axes (each holding the FLOUR default fixed on the other two):
+#   A. Hook layer — module_regex ∈ {layer_3, layer_5, layer_7, layer_9, layer_11, layer_13}
+#   B. Encoder design — full / no_encoder / no_orth
+#   C. Steering coefficient — {2, 4, 6, 8, 10, 12}
+#
+# FLOUR default (used wherever an axis isn't being varied):
+#   module_regex = model.layers.7
+#   steering_coeff = 8
+#   encoder_epochs = 6
+#   orth_weight = 2.0
+#   gamma = 0.5    (matches our best forget05 op-point from sweep_g0.50)
+#   alpha = 2.0
+#   forget_warmup_steps = 30
+#   retain_loss_type = EMBED_DIFF
+#
+# 13 runs total (the "default" point is shared across axes — counted once).
+# Each run trains + evals best/ with full MIA suite. Estimated 25–30 min per run.
+#
+# Usage:
+#   bash scripts/ablation_main.sh                  # all 13 on GPU 0
+#   GPUS=1 bash scripts/ablation_main.sh           # GPU 1
+#   AXES="A" bash scripts/ablation_main.sh         # axis A only
+#   AXES="A B" bash scripts/ablation_main.sh       # subset
+#   DRY_RUN=1 bash scripts/ablation_main.sh        # list what would run
+
+set -e
+
+PYTHON="${PYTHON:-/home/judy/miniconda3/envs/unlearning/bin/python}"
+export MASTER_PORT=$($PYTHON -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
+echo "Master Port: $MASTER_PORT"
+export HF_HOME=/tank/home/judy/.cache/huggingface
+export TRITON_CACHE_DIR=/tank/home/judy/.triton/autotune
+
+MODEL="Llama-3.2-1B-Instruct"
+MODEL_PATH="open-unlearning/tofu_${MODEL}_full"
+GPUS="${GPUS:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+AXES="${AXES:-A B C}"
+
+# Forget05-specific (per the existing scripts)
+FORGET_SPLIT="forget05"
+RETAIN_SPLIT="retain95"
+HOLDOUT_SPLIT="holdout05"
+BATCH=8
+WARMUP=30
+
+# FLOUR defaults
+DEF_LAYER=7
+DEF_COEFF=8
+DEF_ENCODER_EPOCHS=6
+DEF_ORTH_WEIGHT=2.0
+DEF_GAMMA=0.5      # from sweep_g0.50 — best forget05 op-point
+DEF_ALPHA=2.0
+
+run_one() {
+    local NAME=$1
+    local LAYER=$2
+    local COEFF=$3
+    local ENC_EPOCHS=$4
+    local ORTH_W=$5
+
+    local TASK="tofu_${MODEL}_${FORGET_SPLIT}_LatentRMU_v4.8_abl_${NAME}"
+
+    echo "=========================================="
+    echo "  ablation: ${NAME}"
+    echo "  task: ${TASK}"
+    echo "  layer=${LAYER}  coeff=${COEFF}  enc_ep=${ENC_EPOCHS}  orth=${ORTH_W}"
+    echo "  (gamma=${DEF_GAMMA}, alpha=${DEF_ALPHA}, warmup=${WARMUP}, batch=${BATCH})"
+    echo "=========================================="
+
+    if [ -f "saves/unlearn/${TASK}/best/evals/TOFU_EVAL.json" ]; then
+        echo "[skip] already complete at saves/unlearn/${TASK}/best"
+        return
+    fi
+    # Resume case: train finished but eval was interrupted. Skip retrain so we
+    # don't overwrite a valid best/.
+    local SKIP_TRAIN=0
+    if [ -d "saves/unlearn/${TASK}/best" ]; then
+        echo "[resume] best/ exists, eval missing — skipping train, running eval only"
+        SKIP_TRAIN=1
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+        if [ "$SKIP_TRAIN" = "1" ]; then
+            echo "  (dry run — would eval only)"
+        else
+            echo "  (dry run — would train + eval)"
+        fi
+        return
+    fi
+
+    # ── Train ───────────────────────────────────────────────────────────────
+    if [ "$SKIP_TRAIN" != "1" ]; then
+    CUDA_VISIBLE_DEVICES=$GPUS $PYTHON src/train.py --config-name=unlearn.yaml \
+        experiment=unlearn/tofu/default \
+        trainer=LatentRMU \
+        task_name=${TASK} \
+        model=${MODEL} \
+        forget_split=${FORGET_SPLIT} \
+        retain_split=${RETAIN_SPLIT} \
+        model.model_args.pretrained_model_name_or_path=${MODEL_PATH} \
+        retain_logs_path=saves/eval/tofu_${MODEL}_${RETAIN_SPLIT}/TOFU_EVAL.json \
+        trainer.args.per_device_train_batch_size=${BATCH} \
+        trainer.args.gradient_accumulation_steps=1 \
+        trainer.args.num_train_epochs=12 \
+        trainer.args.learning_rate=2e-5 \
+        trainer.args.logging_steps=10 \
+        trainer.args.eval_strategy=epoch \
+        trainer.args.save_strategy=steps \
+        +trainer.args.save_steps=50 \
+        +trainer.args.save_total_limit=8 \
+        trainer.method_args.module_regex="model\.layers\.${LAYER}" \
+        trainer.method_args.encoder_epochs=${ENC_EPOCHS} \
+        trainer.method_args.steering_coeff=${COEFF} \
+        trainer.method_args.latent_dim=256 \
+        trainer.method_args.orth_weight=${ORTH_W} \
+        trainer.method_args.forget_warmup_steps=${WARMUP} \
+        trainer.method_args.gamma=${DEF_GAMMA} \
+        trainer.method_args.alpha=${DEF_ALPHA} \
+        trainer.method_args.retain_loss_type=EMBED_DIFF
+    fi
+
+    # ── Eval best/ with full MIA suite ──────────────────────────────────────
+    if [ -d "saves/unlearn/${TASK}/best" ]; then
+        echo "  [eval] ${TASK}/best (full MIA suite)"
+        CUDA_VISIBLE_DEVICES=$GPUS $PYTHON src/eval.py --config-name=eval.yaml \
+            experiment=eval/tofu/default \
+            eval=tofu_full_privacy \
+            eval.tofu.overwrite=true \
+            forget_split=${FORGET_SPLIT} \
+            holdout_split=${HOLDOUT_SPLIT} \
+            model=${MODEL} \
+            task_name=${TASK}_eval \
+            model.model_args.pretrained_model_name_or_path=saves/unlearn/${TASK}/best \
+            model.tokenizer_args.pretrained_model_name_or_path=saves/unlearn/${TASK}/best \
+            paths.output_dir=saves/unlearn/${TASK}/best/evals \
+            retain_logs_path=saves/eval/tofu_${MODEL}_${RETAIN_SPLIT}/TOFU_EVAL.json
+    else
+        echo "[warn] ${TASK}/best not produced — skipping eval"
+    fi
+
+    echo "Done: saves/unlearn/${TASK}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Default reference run (shared across all 3 axes — runs once)
+default_ran=0
+run_default() {
+    [ $default_ran -eq 1 ] && return
+    run_one "default" $DEF_LAYER $DEF_COEFF $DEF_ENCODER_EPOCHS $DEF_ORTH_WEIGHT
+    default_ran=1
+}
+
+# Axis A — hook layer
+run_axis_A() {
+    echo ""; echo "── AXIS A: hook layer ──"
+    for L in 3 5 7 9 11 13; do
+        if [ "$L" = "$DEF_LAYER" ]; then run_default; continue; fi
+        run_one "layer_${L}" $L $DEF_COEFF $DEF_ENCODER_EPOCHS $DEF_ORTH_WEIGHT
+    done
+}
+
+# Axis B — encoder design
+run_axis_B() {
+    echo ""; echo "── AXIS B: encoder design ──"
+    run_default                                                                     # full encoder + orth
+    run_one "no_encoder" $DEF_LAYER $DEF_COEFF 0 $DEF_ORTH_WEIGHT                   # no Phase 1 training
+    run_one "no_orth"    $DEF_LAYER $DEF_COEFF $DEF_ENCODER_EPOCHS 0.0              # encoder w/o orth reg
+}
+
+# Axis C — steering coefficient
+run_axis_C() {
+    echo ""; echo "── AXIS C: steering coefficient ──"
+    for C in 2 4 6 8 10 12; do
+        if [ "$C" = "$DEF_COEFF" ]; then run_default; continue; fi
+        run_one "coeff_${C}" $DEF_LAYER $C $DEF_ENCODER_EPOCHS $DEF_ORTH_WEIGHT
+    done
+}
+
+echo "================================================================"
+echo "  FLOUR Tier-1 Ablation on ${FORGET_SPLIT}"
+echo "  Axes: ${AXES}     GPU: ${GPUS}     dry_run: ${DRY_RUN}"
+echo "================================================================"
+
+for axis in $AXES; do
+    case "$axis" in
+        A) run_axis_A ;;
+        B) run_axis_B ;;
+        C) run_axis_C ;;
+        *) echo "[warn] unknown axis '$axis' — expected A, B, or C" ;;
+    esac
+done
+
+echo ""
+echo "================================================================"
+echo "  Ablation complete."
+echo "  Aggregate results:"
+echo "    /home/judy/miniconda3/envs/unlearning/bin/python scripts/aggregate_ablation.py"
+echo "================================================================"

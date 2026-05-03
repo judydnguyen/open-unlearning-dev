@@ -28,7 +28,7 @@ per_device_train_batch_size=2
 gradient_accumulation_steps=1     # effective batch = 2 * 1 * 2 GPUs = 4
 
 TRAIN_GPUS="0,1"
-EVAL_GPU="0"
+EVAL_GPU="1"
 ACCEL_CFG=configs/accelerate/ddp_2gpu_config.yaml
 
 data_splits=(
@@ -46,7 +46,7 @@ trainers=(
 )
 
 for data_split in "${data_splits[@]}"; do
-    target_path=saves/finetune/muse_${model}_${data_split}_target/last
+    target_path=saves/finetune/muse_${model}_${data_split}_target
     retain_logs=saves/eval/muse_${model}_${data_split}_retrain/MUSE_EVAL.json
 
     if [ ! -d "$target_path" ]; then
@@ -58,8 +58,10 @@ for data_split in "${data_splits[@]}"; do
     fi
 
     for trainer in "${trainers[@]}"; do
-        task_name=muse_${model}_${data_split}_${trainer}
+        # rm the old folder
+        task_name=muse_${model}_${data_split}_${trainer}_DDP_v2.1
         save_dir=saves/unlearn/${task_name}
+        rm -rf ${save_dir}
 
         echo "============================================="
         echo "Run: $task_name"
@@ -85,7 +87,13 @@ for data_split in "${data_splits[@]}"; do
                 trainer.args.per_device_train_batch_size=${per_device_train_batch_size} \
                 trainer.args.gradient_accumulation_steps=${gradient_accumulation_steps} \
                 trainer.args.ddp_find_unused_parameters=true \
-                trainer.args.gradient_checkpointing=true
+                trainer.args.gradient_checkpointing=true \
+                trainer.args.save_strategy=epoch \
+                trainer.method_args.steering_coeff=10 \
+                +trainer.args.save_total_limit=3 \
+                trainer.args.learning_rate=1e-5
+                # trainer.method_args.encoder_epochs=0
+
         fi
 
         # ---- 2. eval ----

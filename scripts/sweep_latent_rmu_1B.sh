@@ -48,7 +48,7 @@ run_scenario() {
         trainer.args.save_strategy=no \
         trainer.method_args.module_regex="model\.layers\.7" \
         trainer.method_args.encoder_epochs=6 \
-        trainer.method_args.steering_coeff=5 \
+        trainer.method_args.steering_coeff=10 \
         trainer.method_args.latent_dim=256 \
         trainer.method_args.orth_weight=2.0 \
         trainer.method_args.retain_sep_weight=2.0 \

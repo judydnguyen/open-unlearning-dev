@@ -58,7 +58,7 @@ run_scenario() {
         trainer.args.num_train_epochs=12 \
         trainer.args.learning_rate=2e-5 \
         trainer.args.logging_steps=10 \
-        trainer.args.eval_strategy=epoch \
+        trainer.args.eval_strategy=no \
         trainer.args.save_strategy=no \
         trainer.args.gradient_checkpointing=true \
         '+trainer.args.gradient_checkpointing_kwargs={use_reentrant: false}' \
@@ -88,7 +88,7 @@ run_scenario() {
 }
 
 # Scenario 1: News  — batch=2, warmup=10, steering_coeff=10
-run_scenario News  2 10 10
+run_scenario News 2 2 30
 
 # Scenario 2: Books — batch=2, warmup=10, steering_coeff=10
 # run_scenario Books 2 10 10

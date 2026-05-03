@@ -131,8 +131,15 @@ class LatentRMUParallel(GradDiff):
     # ------------------------------------------------------------------ #
 
     def _maybe_wrap_encoder(self):
-        """Idempotent DDP wrapping. Call before encoder is used in Phase 1."""
+        """Idempotent DDP wrapping. Call before encoder is used in Phase 1.
+
+        Skipped when no encoder param requires grad (Phase 2, or encoder_epochs=0):
+        DDP rejects modules with zero trainable params, and the encoder is only
+        used under torch.no_grad() in Phase 2 anyway.
+        """
         if self._encoder_ddp_wrapped or not _is_dist():
+            return
+        if not any(p.requires_grad for p in self._encoder_raw.parameters()):
             return
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))

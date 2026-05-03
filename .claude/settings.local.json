@@ -125,7 +125,15 @@
       "Bash(DRY_RUN=1 bash /tank/home/judy/walla-code/open-unlearning-dev/scripts/reeval_full_privacy.sh)",
       "Bash(GPU=0 bash /tank/home/judy/walla-code/open-unlearning-dev/scripts/reeval_full_privacy.sh)",
       "Bash(git -C /tank/home/judy/walla-code/open-unlearning-dev diff --stat src/trainer/unlearn/rmu_encoder_parallel.py)",
-      "Bash(bash -n /tank/home/judy/walla-code/open-unlearning-dev/scripts/tofu_unlearn.sh)"
+      "Bash(bash -n /tank/home/judy/walla-code/open-unlearning-dev/scripts/tofu_unlearn.sh)",
+      "Bash(bash -n /tank/home/judy/walla-code/open-unlearning-dev/scripts/sweep_latent_rmu_gamma.sh)",
+      "Bash(git -C /tank/home/judy/walla-code/open-unlearning-dev log --all --oneline -- scripts/tofu_unlearn.sh)",
+      "Bash(git -C /tank/home/judy/walla-code/open-unlearning-dev log --all --diff-filter=M --oneline -- scripts/tofu_unlearn.sh)",
+      "Bash(git -C /tank/home/judy/walla-code/open-unlearning-dev log --all --diff-filter=D --oneline -- \"saves/*NPO*\")",
+      "Bash(git -C /tank/home/judy/walla-code/open-unlearning-dev show 7fbbf7d:scripts/tofu_unlearn.sh)",
+      "Bash(bash scripts/eval_muse_checkpoints.sh saves/unlearn/muse_Llama-3.2-3B-Instruct_News_LatentRMUParallelDDP_DDP_v2 News Llama-3.2-3B-Instruct 0)",
+      "Bash(DRY_RUN=1 bash scripts/ablation_main.sh)",
+      "Bash(bash -n /tank/home/judy/walla-code/open-unlearning-dev/scripts/muse_sweep_coeff_gamma_7b.sh)"
     ],
     "additionalDirectories": [
       "/home/judy/code/open-unlearning-dev/scripts",

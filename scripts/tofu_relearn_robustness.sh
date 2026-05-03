@@ -21,7 +21,7 @@ retain_logs_path="saves/eval/tofu_${model}_${retain_split}/TOFU_EVAL.json"
 
 # method_name  unlearned_checkpoint
 methods=(
-    "LatentRMU saves/unlearn/ablation/LatentRMU_full_forget01/best"
+    "LatentRMU saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget01_LatentRMU_v7.2_coeff0p5/best"
     # "RMU saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget01_RMU"
     # "GradAscent saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget01_GradAscent"
     # "GradDiff saves/unlearn/tofu_Llama-3.2-1B-Instruct_forget01_GradDiff"

@@ -13,7 +13,7 @@ class PerSampleEncoder(nn.Module):
     Last layer of delta is zero-initialized so r = alpha * h_pooled at init,
     a meaningful (non-zero, non-NaN) starting direction.
     """
-    def __init__(self, hidden_size: int, latent_dim: int = 256, num_layers: int = 2, alpha: float = 0.2):
+    def __init__(self, hidden_size: int, latent_dim: int = 256, num_layers: int = 2, alpha: float = 0.5):
         super().__init__()
         assert num_layers >= 2, "num_layers must be at least 2"
         self.alpha = alpha

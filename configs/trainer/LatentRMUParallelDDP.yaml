@@ -20,10 +20,12 @@ method_args:
   module_regex: "model\\.layers\\.16"
 
   # Params to update during Phase 2 — restrict to a few MLP layers so AdamW
-  # optimizer states (~1.4 GB) fit alongside the 13.5 GB model + 13.5 GB ref.
-  # Layers 14-17 cover the mid-to-upper range where factual knowledge is stored.
+  # optimizer states fit alongside model + frozen ref.
+  # Layers must be <= module_regex layer (16): both forget and retain losses
+  # consume the cached layer-16 activation, so any layer > 16 receives no grad
+  # and DDP crashes at iter 2 with "did not receive grad" on rebuild_buckets.
   trainable_params_regex:
-    - "model\\.layers\\.(14|15|16|17)\\.mlp\\.down_proj\\.weight"
+    - "model\\.layers\\.(14|15|16)\\.mlp\\.down_proj\\.weight"
 
   # Encoder / Phase 1
   latent_dim: 256
@@ -43,5 +45,5 @@ method_args:
 
   # Inherited from GradDiff / RMU
   gamma: 8.0
-  alpha: 0.5
+  alpha: 1.0
   retain_loss_type: EMBED_DIFF

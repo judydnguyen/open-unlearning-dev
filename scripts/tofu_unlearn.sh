@@ -32,7 +32,7 @@ splits=(
 
 
 per_device_train_batch_size=4 # on two gpus would make effective batch size 32
-gradient_accumulation_steps=1
+gradient_accumulation_steps=2
 
 
 ########################################################################################################################
@@ -50,7 +50,7 @@ for split in "${splits[@]}"; do
             trainer=$(echo $trainer_experiment | cut -d' ' -f1)
             experiment=$(echo $trainer_experiment | cut -d' ' -f2)
             
-            task_name=tofu_${model}_${forget_split}_${trainer} 
+            task_name=tofu_${model}_${forget_split}_${trainer}_v2 
             model_path=open-unlearning/tofu_${model}_full
             echo ${task_name}: Unlearning ${model_path} using ${trainer}
 
