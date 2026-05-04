@@ -28,6 +28,12 @@ if [ ! -f "$RETAIN_LOGS" ]; then
     echo "[warn] retain logs missing at $RETAIN_LOGS (privleak will be off)"
 fi
 
+# /tank is NFS — safetensors mmap from NFS under memory pressure causes SIGBUS.
+# Stage each checkpoint to local /tmp before loading; clean up on exit.
+STAGE_ROOT="${STAGE_ROOT:-/tmp/eval_stage_$$}"
+mkdir -p "$STAGE_ROOT"
+trap 'rm -rf "$STAGE_ROOT"' EXIT
+
 shopt -s nullglob
 ckpts=("$SAVE_DIR"/checkpoint-*)
 if [ ${#ckpts[@]} -eq 0 ]; then
@@ -49,11 +55,18 @@ for ckpt in "${ckpts[@]}"; do
         continue
     fi
 
+    # Stage to local disk to avoid NFS-mmap SIGBUS.
+    staged="$STAGE_ROOT/checkpoint-${step}"
+    rm -rf "$staged"
+    mkdir -p "$staged"
+    echo "[stage] copying $(du -sh "$ckpt" | cut -f1) → $staged"
+    cp -r "$ckpt"/* "$staged"/
+
     task_name=$(basename "$SAVE_DIR")_ckpt${step}
     echo "============================================="
     echo "Eval checkpoint-${step}"
-    echo "  ckpt    = $ckpt"
-    echo "  out_dir = $out_dir"
+    echo "  ckpt (staged) = $staged"
+    echo "  out_dir       = $out_dir"
     echo "============================================="
 
     CUDA_VISIBLE_DEVICES=$EVAL_GPU python src/eval.py \
@@ -61,9 +74,12 @@ for ckpt in "${ckpts[@]}"; do
         data_split=${DATA_SPLIT} \
         task_name=${task_name} \
         model=${MODEL} \
-        model.model_args.pretrained_model_name_or_path=${ckpt} \
+        model.model_args.pretrained_model_name_or_path=${staged} \
         paths.output_dir=${out_dir} \
         retain_logs_path=${RETAIN_LOGS}
+
+    # Free local stage dir between iterations to keep /tmp from filling.
+    rm -rf "$staged"
 done
 
 echo "=== All checkpoint evals done. Compare with: ==="
