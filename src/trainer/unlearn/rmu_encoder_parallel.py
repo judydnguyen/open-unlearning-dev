@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import torch
@@ -7,6 +8,8 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import deepspeed
 from trainer.unlearn.grad_diff import GradDiff
+
+logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------ #
@@ -91,6 +94,8 @@ class LatentRMUParallel(GradDiff):
         encoder_lr=1e-3,
         forget_warmup_steps=0,
         coeff_warmup_steps=0,
+        forget_nll_weight=0.0,
+        forget_nll_warmup_steps=0,
         *args, **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -110,6 +115,8 @@ class LatentRMUParallel(GradDiff):
         self.encoder_lr = encoder_lr
         self.forget_warmup_steps = forget_warmup_steps
         self.coeff_warmup_steps = coeff_warmup_steps
+        self.forget_nll_weight = forget_nll_weight
+        self.forget_nll_warmup_steps = forget_nll_warmup_steps
 
         self._phase = 1
         self._phase2_step = 0
@@ -197,6 +204,30 @@ class LatentRMUParallel(GradDiff):
             and p.requires_grad
         ]
 
+    def _log_phase2_param_summary(self):
+        """Log which params matched trainable_params_regex. Catches the silent
+        no-op case where the regex matches zero params and the optimizer steps
+        on nothing."""
+        if _rank() != 0:
+            return
+        m = self._unwrap(self.model)
+        matched = [(n, p) for n, p in m.named_parameters() if p.requires_grad]
+        total_numel = sum(p.numel() for _, p in matched)
+        logger.info(
+            "[phase2] %d trainable params matched %s (total numel=%s)",
+            len(matched), self.trainable_params_regex, f"{total_numel:,}",
+        )
+        for n, p in matched[:16]:
+            logger.info("[phase2]   %s shape=%s", n, tuple(p.shape))
+        if len(matched) > 16:
+            logger.info("[phase2]   ... and %d more", len(matched) - 16)
+        if not matched:
+            logger.error(
+                "[phase2] NO PARAMS MATCH %s. Optimizer step will be a no-op. "
+                "Check the regex against model.named_parameters().",
+                self.trainable_params_regex,
+            )
+
     def forward_with_cache(self, model, inputs, module, no_grad=True):
         cache = []
         def hook(_m, _i, output):
@@ -268,6 +299,12 @@ class LatentRMUParallel(GradDiff):
             super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
             resume_from_checkpoint = None
 
+            # Persist encoder weights for offline trajectory analysis.
+            if _rank() == 0 and self.args.output_dir:
+                enc_path = os.path.join(self.args.output_dir, "encoder.pt")
+                torch.save(self._encoder_module().state_dict(), enc_path)
+                logger.info("[phase1] saved encoder to %s", enc_path)
+
         # Phase 2: freeze encoder, unlearn LLM
         self._phase = 2
         self._freeze_all_params(self._encoder_module(), requires_grad=False)
@@ -295,6 +332,7 @@ class LatentRMUParallel(GradDiff):
             self._freeze_all_params(self._encoder_module(), requires_grad=False)
             self._freeze_all_params(self.model, requires_grad=False)
             self._set_trainable_params(self.model, self.trainable_params_regex, True)
+            self._log_phase2_param_summary()
             super().create_optimizer()
 
     # ------------------------------------------------------------------ #
@@ -443,9 +481,25 @@ class LatentRMUParallel(GradDiff):
             warmup_coeff = min(1.0, self._phase2_step / self.forget_warmup_steps)
         else:
             warmup_coeff = 1.0
+        if self.forget_nll_weight > 0.0 and self.forget_nll_warmup_steps > 0:
+            nll_warmup = min(1.0, self._phase2_step / self.forget_nll_warmup_steps)
+        elif self.forget_nll_weight > 0.0:
+            nll_warmup = 1.0
+        else:
+            nll_warmup = 0.0
         self._phase2_step += 1
 
         loss = self.gamma * warmup_coeff * forget_loss + self.alpha * retain_loss
+
+        # Token-level forget pressure: subtract β * forget_nll so the LM head
+        # is pushed away from the memorized continuation. Activation steering
+        # alone leaves token likelihoods (and MIA-based privleak) close to
+        # the target model — this term targets that residual.
+        forget_nll_val = 0.0
+        if self.forget_nll_weight > 0.0 and forget_outputs.loss is not None:
+            forget_nll = forget_outputs.loss
+            loss = loss - self.forget_nll_weight * nll_warmup * forget_nll
+            forget_nll_val = forget_nll.detach()
 
         with torch.no_grad():
             log_tensors = {
@@ -453,15 +507,61 @@ class LatentRMUParallel(GradDiff):
                 "train/retain_loss": retain_loss.detach().clone(),
                 "train/displacement": r_scaled.norm(dim=-1).mean(),
             }
+            if self.forget_nll_weight > 0.0:
+                log_tensors["train/forget_nll"] = (
+                    forget_nll_val.clone() if torch.is_tensor(forget_nll_val)
+                    else torch.tensor(0.0, device=h_forget.device)
+                )
             for v in log_tensors.values():
                 _all_reduce_mean_(v)
             log_dict = {k: v.item() for k, v in log_tensors.items()}
             log_dict["train/forget_warmup_coeff"] = warmup_coeff
+            log_dict["train/forget_nll_warmup_coeff"] = nll_warmup
             log_dict["train/steering_coeff"] = self._ramped_steering_coeff()
 
         if _rank() == 0:
             self.log(log_dict)
         return loss, forget_outputs
+
+    # ------------------------------------------------------------------ #
+    #  Phase 2 grad-norm diagnostic                                       #
+    # ------------------------------------------------------------------ #
+
+    def training_step(self, *args, **kwargs):
+        """Wrap super().training_step to log phase-2 grad norm.
+
+        Catches the silent no-op case: if forget/retain losses look fine but
+        grad norm on trainable params is ~0, the optimizer is stepping on
+        gradients that don't carry signal.
+        """
+        loss = super().training_step(*args, **kwargs)
+
+        if self._phase != 2:
+            return loss
+
+        # Log every `logging_steps` (default 10). _phase2_step was incremented
+        # in _phase2_loss, so it reflects the current micro-batch index.
+        log_every = max(1, int(getattr(self.args, "logging_steps", 10)))
+        if self._phase2_step % log_every != 0:
+            return loss
+
+        with torch.no_grad():
+            params = self._get_phase2_params()
+            sq_sum = torch.zeros((), device=loss.device, dtype=torch.float32)
+            n_with_grad = 0
+            for p in params:
+                if p.grad is not None:
+                    sq_sum += p.grad.detach().float().pow(2).sum()
+                    n_with_grad += 1
+            total_norm = sq_sum.sqrt()
+            _all_reduce_mean_(total_norm)
+            if _rank() == 0:
+                self.log({
+                    "train/phase2_param_grad_norm": total_norm.item(),
+                    "train/phase2_n_params_with_grad": n_with_grad,
+                    "train/phase2_n_params_total": len(params),
+                })
+        return loss
 
     # ------------------------------------------------------------------ #
     #  Retain loss                                                        #

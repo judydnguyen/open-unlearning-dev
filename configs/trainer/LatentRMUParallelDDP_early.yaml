@@ -6,5 +6,7 @@ defaults:
 
 method_args:
   module_regex: "model\\.layers\\.7"
+  # Layers must be <= module_regex layer (7): EMBED_DIFF computes loss at the
+  # layer-7 hook, so layer 8+ receives no grad and DDP crashes at iter 2.
   trainable_params_regex:
-    - "model\\.layers\\.(5|6|7|8)\\.mlp\\.down_proj\\.weight"
+    - "model\\.layers\\.(4|5|6|7)\\.mlp\\.down_proj\\.weight"

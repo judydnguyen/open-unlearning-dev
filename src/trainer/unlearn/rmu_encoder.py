@@ -1,3 +1,4 @@
+import os
 import re
 import torch
 import torch.nn as nn
@@ -153,6 +154,11 @@ class LatentRMU(GradDiff):
         self._set_trainable_params(self.model, self.trainable_params_regex, True)
         self.args.num_train_epochs = self.encoder_epochs
         super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
+
+        if self.args.output_dir:
+            enc_path = os.path.join(self.args.output_dir, "encoder.pt")
+            torch.save(self.encoder.state_dict(), enc_path)
+            print(f"[phase1] saved encoder to {enc_path}", flush=True)
 
         self._phase = 2
         self._freeze_all_params(self.encoder, requires_grad=False)

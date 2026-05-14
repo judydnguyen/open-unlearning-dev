@@ -25,11 +25,8 @@ method_args:
   encoder_lr: 1e-3
   steering_coeff: 5
   orth_weight: 2.0
-  retain_sep_weight: 2.0
   anchor_weight: 1.0
   forget_warmup_steps: 10
   gamma: 1.0
   alpha: 2.0
   retain_loss_type: EMBED_DIFF
-  use_lora: false
-  retain_pca_components: 64
