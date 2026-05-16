@@ -9,7 +9,8 @@ Override reward_fn to customise the forgetting signal:
 
 Default reward blends four signals (weights must sum ≤ 1):
   ref_reward   = -log_ref(completion | prompt), normalised per-group to [0, 1]
-  anti_answer  = 1 - ROUGE1_recall(completion, gt)
+  anti_answer  = 1 - sim(completion, gt), where sim ∈ {ROUGE1_recall, BERTScore-F1}
+                 selected by reward_type ∈ {"rouge", "bert"}.
   naturalness  = cosine(h_policy, h_ref), rescaled to [0, 1]
   retain       = sigmoid(log_policy(retain) - log_ref(retain)), rescaled to [0, 1]
                  High when the policy is at least as fluent as ref on retain text.
@@ -79,6 +80,43 @@ def _rouge1_recall(hyp: str, ref: str) -> float:
     return sum(t in hyp_set for t in ref_tokens) / len(ref_tokens)
 
 
+class _BertScorer:
+    """BERTScore-style token-level F1 using a sentence-transformer encoder.
+
+    For each (hyp, ref) pair: cosine-sim every hyp token to every ref token,
+    take per-token max, average (precision over hyp tokens, recall over ref
+    tokens), return F1 clamped to [0, 1]. Encoder is frozen and inference-only.
+    """
+
+    def __init__(self, model_name: str, device, max_length: int = 128):
+        from transformers import AutoModel, AutoTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name).eval().to(device)
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.device = device
+        self.max_length = max_length
+
+    @torch.no_grad()
+    def score(self, hyps: List[str], refs: List[str]) -> List[float]:
+        if not hyps:
+            return []
+        enc_h = self.tokenizer(list(hyps), padding=True, truncation=True,
+                               max_length=self.max_length, return_tensors="pt").to(self.device)
+        enc_r = self.tokenizer(list(refs), padding=True, truncation=True,
+                               max_length=self.max_length, return_tensors="pt").to(self.device)
+        h = F.normalize(self.model(**enc_h).last_hidden_state, dim=-1)
+        r = F.normalize(self.model(**enc_r).last_hidden_state, dim=-1)
+        mh = enc_h["attention_mask"].bool()
+        mr = enc_r["attention_mask"].bool()
+        sim = torch.einsum("btd,brd->btr", h, r)
+        sim = sim.masked_fill(~(mh.unsqueeze(2) & mr.unsqueeze(1)), -1e4)
+        prec = (sim.max(dim=2).values * mh).sum(1) / mh.sum(1).clamp(min=1)
+        rec  = (sim.max(dim=1).values * mr).sum(1) / mr.sum(1).clamp(min=1)
+        f1 = 2 * prec * rec / (prec + rec).clamp(min=1e-8)
+        return f1.clamp(0.0, 1.0).cpu().tolist()
+
+
 def _prompt_hash(prompt: str) -> str:
     return hashlib.md5(prompt.encode()).hexdigest()
 
@@ -108,6 +146,9 @@ class SteerGRPO(UnlearnTrainer):
         # Reward weights
         answer_reward_weight: float = 0.75,
         naturalness_reward_weight: float = 0.0,
+        # Answer-similarity backend: "rouge" = ROUGE-1 recall; "bert" = BERTScore-F1.
+        reward_type: str = "rouge",
+        bert_score_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         retain_reward_weight: float = 0.0,   # 0 = disabled; try 0.1–0.2
         retain_loss_weight: float = 0.0,     # NLL on retain samples; 0 = disabled
         kl_beta: float = 0.0,               # KL penalty vs ref on forget completions; 0 = disabled
@@ -145,6 +186,9 @@ class SteerGRPO(UnlearnTrainer):
         self.entropy_beta             = entropy_beta
         self.answer_reward_weight      = answer_reward_weight
         self.naturalness_reward_weight = naturalness_reward_weight
+        self.reward_type               = reward_type
+        self.bert_score_model          = bert_score_model
+        self._bert_scorer              = None
         self.retain_reward_weight      = retain_reward_weight
         self.retain_loss_weight        = retain_loss_weight
         self.retain_grpo_weight        = retain_grpo_weight
@@ -210,7 +254,8 @@ class SteerGRPO(UnlearnTrainer):
           ref_reward  : how surprising the completion is to the ref model.
                         Per-group min-max normalised so GRPO can contrast
                         completions within the same prompt.
-          anti_answer : 1 - ROUGE1_recall(completion, ground_truth).
+          anti_answer : 1 - sim(completion, ground_truth), where sim is
+                        ROUGE-1 recall or BERTScore-F1 per reward_type.
                         Zero when the model perfectly recites the answer.
           naturalness : cosine similarity of policy vs ref hidden states,
                         rescaled from [-1, 1] to [0, 1].
@@ -233,8 +278,8 @@ class SteerGRPO(UnlearnTrainer):
 
         # ── anti_answer ───────────────────────────────────────────────────────
         if gt_answers is not None and self.answer_reward_weight > 0.0:
-            anti_answer = [1.0 - _rouge1_recall(c, g)
-                           for c, g in zip(completions, gt_answers)]
+            sims = self._answer_similarity(completions, gt_answers)
+            anti_answer = [1.0 - s for s in sims]
         else:
             anti_answer = [0.5] * N
 
@@ -268,6 +313,20 @@ class SteerGRPO(UnlearnTrainer):
         ]
 
     # ── Reward components ─────────────────────────────────────────────────────
+
+    def _answer_similarity(self, completions: List[str], gt_answers: List[str]) -> List[float]:
+        """Sequence similarity in [0, 1]; higher = closer to the gold answer."""
+        if self.reward_type == "rouge":
+            return [_rouge1_recall(c, g) for c, g in zip(completions, gt_answers)]
+        if self.reward_type == "bert":
+            if self._bert_scorer is None:
+                self._bert_scorer = _BertScorer(
+                    self.bert_score_model, device=self.accelerator.device,
+                )
+            return self._bert_scorer.score(completions, gt_answers)
+        raise ValueError(
+            f"Unknown reward_type={self.reward_type!r}; expected 'rouge' or 'bert'."
+        )
 
     def _ref_reward(self, prompts: List[str], completions: List[str]) -> List[float]:
         """

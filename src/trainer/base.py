@@ -133,25 +133,40 @@ class FinetuneTrainer(Trainer):
                         self.state.global_step, ckpt_model_dir,
                     )
                 mu = eval_metrics.get("model_utility")
-                ner = eval_metrics.get("forget_Q_A_NER")
-                if mu is not None and ner is not None:
-                    joint_score = (mu + ner) / 2.0
+                fq = eval_metrics.get("forget_Q_A_Prob")
+                pl = eval_metrics.get("privleak")
+                if mu is not None and fq is not None and pl is not None:
+                    util_c = max(0.0, min(1.0, mu))
+                    forget_c = max(0.0, min(1.0, 1.0 - fq))
+                    priv_c = max(0.0, 1.0 - min(abs(pl), 100.0) / 100.0)
+                    parts = [max(util_c, 1e-10), max(forget_c, 1e-10), max(priv_c, 1e-10)]
+                    joint_score = 3.0 / sum(1.0 / p for p in parts)
                 else:
                     joint_score = None
                 if joint_score is not None and joint_score > self._best_forget_quality:
                     self._best_forget_quality = joint_score
                     best_dir = os.path.join(run_dir, "best")
+                    # Remove stale evals before saving so they can't outlive the model
+                    stale_evals = os.path.join(best_dir, "evals")
+                    if os.path.exists(stale_evals):
+                        shutil.rmtree(stale_evals)
                     self.save_model(best_dir)
                     with open(os.path.join(best_dir, "best_step.json"), "w") as _f:
                         json.dump({
                             "step": self.state.global_step,
                             "model_utility": mu,
-                            "forget_Q_A_NER": ner,
+                            "forget_Q_A_Prob": fq,
+                            "privleak": pl,
+                            "util_component": util_c,
+                            "forget_component": forget_c,
+                            "priv_component": priv_c,
                             "joint_score": joint_score,
                         }, _f, indent=2)
                     logger.info(
-                        "New best joint_score=%.4f (model_utility=%.4f, forget_Q_A_NER=%.4f) at step %d → saved to %s",
-                        joint_score, mu, ner, self.state.global_step, best_dir,
+                        "New best joint_score=%.4f (util=%.4f, forget=%.4f, priv=%.4f) "
+                        "[mu=%.4f, forget_Q_A_Prob=%.4f, privleak=%.4f] at step %d → saved to %s",
+                        joint_score, util_c, forget_c, priv_c,
+                        mu, fq, pl, self.state.global_step, best_dir,
                     )
                 return eval_metrics
 
