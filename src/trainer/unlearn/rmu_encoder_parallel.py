@@ -306,12 +306,18 @@ class LatentRMUParallel(GradDiff):
                 logger.info("[phase1] saved encoder to %s", enc_path)
 
         # Phase 2: freeze encoder, unlearn LLM
+        # Phase 2 length = num_train_epochs (caller-stated training budget).
+        # Previously Phase 2 was (num_train_epochs - encoder_epochs), which meant
+        # sweeping encoder_epochs ∈ {0, 2, 4, 6} confounded Phase-1 length WITH
+        # Phase-2 length (encoder=0 got more Phase-2 epochs than encoder=6 → unfair).
+        # Now Phase 2 is always num_train_epochs, so encoder_epochs only changes
+        # Phase-1 length. Total = encoder_epochs + num_train_epochs.
         self._phase = 2
         self._freeze_all_params(self._encoder_module(), requires_grad=False)
         self._encoder_module().eval()
         self.optimizer = None
         self.lr_scheduler = None
-        self.args.num_train_epochs = original_epochs - self.encoder_epochs
+        self.args.num_train_epochs = original_epochs
         super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
 
         self.args.num_train_epochs = original_epochs
@@ -359,7 +365,10 @@ class LatentRMUParallel(GradDiff):
     #  Loss computation                                                   #
     # ------------------------------------------------------------------ #
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # transformers 4.46+ passes num_items_in_batch into compute_loss; we
+        # don't use it (loss is already mean-reduced), so swallow it via
+        # **kwargs — same as SteerGRPO / reward_unlearn in this repo.
         forget_inputs = {k: inputs["forget"][k] for k in ("input_ids", "attention_mask", "labels")}
         retain_inputs = {k: inputs["retain"][k] for k in ("input_ids", "attention_mask", "labels")}
         mask = forget_inputs["labels"] != -100

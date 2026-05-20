@@ -1,3 +1,5 @@
+import _compat  # noqa: F401  torch 2.4 / transformers 5.8 shim; must be first
+
 import hydra
 from omegaconf import DictConfig
 from data import get_data, get_collators

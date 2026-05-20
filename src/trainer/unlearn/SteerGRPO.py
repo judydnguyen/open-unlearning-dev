@@ -21,12 +21,15 @@ Default reward blends four signals (weights must sum ≤ 1):
 import copy
 import hashlib
 import os
+import re
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from trainer.unlearn.base import UnlearnTrainer
+from trainer.unlearn import _purge_rewards
 
 try:
     from peft import get_peft_model, LoraConfig, TaskType
@@ -146,9 +149,21 @@ class SteerGRPO(UnlearnTrainer):
         # Reward weights
         answer_reward_weight: float = 0.75,
         naturalness_reward_weight: float = 0.0,
-        # Answer-similarity backend: "rouge" = ROUGE-1 recall; "bert" = BERTScore-F1.
+        # reward_type:
+        #   "rouge" / "bert"               — answer-similarity backend for the anti_answer term
+        #   "binary" / "exponential_decay" / "pagerank"
+        #                                  — PURGE rewards (returns the raw PURGE score and
+        #                                    SKIPS the SteerGRPO blend; combine with the
+        #                                    hygiene defaults in PurgeGRPO for a faithful baseline)
         reward_type: str = "rouge",
         bert_score_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        # PURGE forget vocabulary (used only when reward_type is a PURGE one).
+        forget_words: Optional[List[str]] = None,
+        forget_words_file: Optional[str] = None,
+        target_entity: Optional[str] = None,
+        decay_tau: float = 1.0,
+        decay_base: float = 2.718281828459045,
+        pagerank_quantile: float = 0.75,
         retain_reward_weight: float = 0.0,   # 0 = disabled; try 0.1–0.2
         retain_loss_weight: float = 0.0,     # NLL on retain samples; 0 = disabled
         kl_beta: float = 0.0,               # KL penalty vs ref on forget completions; 0 = disabled
@@ -224,6 +239,30 @@ class SteerGRPO(UnlearnTrainer):
                 ),
             )
 
+        # ── PURGE reward state ────────────────────────────────────────────
+        # Only populated when reward_type is one of the PURGE options;
+        # otherwise these stay empty so the existing rouge/bert branch is
+        # untouched.
+        self.decay_tau = float(decay_tau)
+        self.decay_base = float(decay_base)
+        self._purge_terms: List[str] = []
+        self._purge_pattern: Optional["re.Pattern"] = None
+        self._purge_weights: Optional[np.ndarray] = None
+        if _purge_rewards.is_purge_reward_type(self.reward_type):
+            self._purge_terms = _purge_rewards.resolve_terms(
+                forget_words, forget_words_file, target_entity,
+            )
+            self._purge_pattern = _purge_rewards.compile_pattern(self._purge_terms)
+            if self.reward_type == "pagerank":
+                self._purge_weights = _purge_rewards.compute_pagerank_weights(
+                    self._purge_terms, self.ref_model, self.tokenizer,
+                    quantile=pagerank_quantile, seeded=bool(target_entity),
+                )
+            print(
+                f"[SteerGRPO] PURGE reward active: type={self.reward_type}, "
+                f"{len(self._purge_terms)} forget terms"
+            )
+
     # ── Reference model ───────────────────────────────────────────────────────
 
     def _make_ref_model(self, model):
@@ -269,6 +308,22 @@ class SteerGRPO(UnlearnTrainer):
         """
         G = self.group_size
         N = len(completions)
+
+        # ── PURGE reward shortcut ─────────────────────────────────────────
+        # If reward_type is one of the PURGE options, return the raw PURGE
+        # per-completion score and skip the SteerGRPO blend (anti_answer,
+        # naturalness, retain, ref_reward). This makes SteerGRPO usable as
+        # a faithful PURGE baseline — see [[purge-as-component]].
+        if _purge_rewards.is_purge_reward_type(self.reward_type):
+            fn = _purge_rewards.REWARD_FUNCS[self.reward_type]
+            return fn(
+                completions,
+                pattern=self._purge_pattern,
+                terms=self._purge_terms,
+                weights=self._purge_weights,
+                decay_tau=self.decay_tau,
+                decay_base=self.decay_base,
+            )
 
         # ── ref_reward ────────────────────────────────────────────────────────
         ref_raw  = self._ref_reward(prompts, completions)
@@ -325,7 +380,9 @@ class SteerGRPO(UnlearnTrainer):
                 )
             return self._bert_scorer.score(completions, gt_answers)
         raise ValueError(
-            f"Unknown reward_type={self.reward_type!r}; expected 'rouge' or 'bert'."
+            f"Unknown reward_type={self.reward_type!r}; expected one of "
+            "'rouge', 'bert', 'binary', 'exponential_decay', 'pagerank'. "
+            "(PURGE reward types should be handled before _answer_similarity is called.)"
         )
 
     def _ref_reward(self, prompts: List[str], completions: List[str]) -> List[float]:
@@ -636,7 +693,8 @@ class SteerGRPO(UnlearnTrainer):
 
     # ── Main loss ─────────────────────────────────────────────────────────────
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # transformers >=5 passes num_items_in_batch; absorb into **kwargs.
         forget_inputs = {k: inputs["forget"][k] for k in ("input_ids", "attention_mask", "labels")}
 
         # Stash retain inputs so reward_fn can access them during generation.

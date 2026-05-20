@@ -6,6 +6,68 @@ import torch.nn.functional as F
 import deepspeed
 from trainer.unlearn.grad_diff import GradDiff
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _MPL_OK = True
+except Exception:
+    _MPL_OK = False
+
+
+# Phase 1 metric groups for the diagnostic plot. Each row is one subplot.
+# Keys must match what _phase1_loss logs via self.log({...}).
+_PHASE1_PLOT_GROUPS = [
+    ("Loss components", [
+        ("phase1/anchor_loss",     "anchor_loss = 1 − cos(r, dontknow)", "tab:blue"),
+        ("phase1/forget_loss_sim", "forget MSE (Phase-2 simulated)",     "tab:orange"),
+    ]),
+    ("Encoder alignment with dontknow", [
+        ("phase1/cos_r_dontknow", "cos(r, dontknow)", "tab:green"),
+    ]),
+    ("Phase-2 displacement at init", [
+        ("phase1/displacement_h_to_target", "||target − h_forget||", "tab:gray"),
+    ]),
+    ("Encoder direction magnitude", [
+        ("phase1/r_norm", "||r|| (pre-normalize)", "tab:purple"),
+    ]),
+]
+
+
+def _refresh_phase1_plot(run_dir, log_history):
+    """Plot Phase 1 diagnostics → {run_dir}/phase1_losses.png.
+
+    Reads only entries that contain phase1/* keys; skips Phase 2 / eval rows.
+    Safe to call repeatedly — write is cheap relative to a train step.
+    """
+    if not _MPL_OK or not log_history or not run_dir:
+        return
+    rows = [h for h in log_history if any(k.startswith("phase1/") for k in h)]
+    if not rows:
+        return
+    xs = [h.get("epoch", i) for i, h in enumerate(rows)]
+    n = len(_PHASE1_PLOT_GROUPS)
+    fig, axes = plt.subplots(n, 1, figsize=(10, 2.4 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+    for ax, (title, series) in zip(axes, _PHASE1_PLOT_GROUPS):
+        plotted_any = False
+        for key, label, color in series:
+            vals = [h.get(key) for h in rows]
+            if not any(v is not None for v in vals):
+                continue
+            ax.plot(xs, vals, label=label, color=color, marker=".", markersize=3, linewidth=1)
+            plotted_any = True
+        ax.set_title(title, fontsize=10)
+        ax.grid(True, alpha=0.3)
+        if plotted_any:
+            ax.legend(loc="best", fontsize=8)
+    axes[-1].set_xlabel("Epoch (Phase 1)")
+    fig.suptitle(f"Phase 1 training trace — {os.path.basename(run_dir)}", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(os.path.join(run_dir, "phase1_losses.png"), dpi=120)
+    plt.close(fig)
+
 
 class PerSampleEncoder(nn.Module):
     """Residual MLP encoder that produces a steering direction.
@@ -14,7 +76,7 @@ class PerSampleEncoder(nn.Module):
     Last layer of delta is zero-initialized so r = alpha * h_pooled at init,
     a meaningful (non-zero, non-NaN) starting direction.
     """
-    def __init__(self, hidden_size: int, latent_dim: int = 256, num_layers: int = 2, alpha: float = 0.5):
+    def __init__(self, hidden_size: int, latent_dim: int = 256, num_layers: int = 2, alpha: float = 0.2):
         super().__init__()
         assert num_layers >= 2, "num_layers must be at least 2"
         self.alpha = alpha
@@ -44,8 +106,10 @@ class LatentRMU(GradDiff):
         encoder_epochs=2,
         encoder_layers=2,
         encoder_alpha=0.5,
-        orth_weight=1.0,
+        orth_weight=1.0,              # deprecated: grad_conflict term removed; kept for config compat
         anchor_weight=1.0,
+        simulated_forget_weight=1.0,  # weight for Phase-2-simulated forget MSE in Phase-1 loss
+        encoder_warmup_steps=0,       # pre-Phase-1 steps aligning r with dontknow
         encoder_lr=1e-3,
         forget_warmup_steps=0,
         coeff_warmup_steps=0,
@@ -63,8 +127,10 @@ class LatentRMU(GradDiff):
         self.ref_module = self._get_matching_module(self.ref_model, self.module_regex)
         self.steering_coeff = steering_coeff
         self.encoder_epochs = encoder_epochs
-        self.orth_weight = orth_weight
+        self.orth_weight = orth_weight  # unused; kept so existing configs don't fail
         self.anchor_weight = anchor_weight
+        self.simulated_forget_weight = simulated_forget_weight
+        self.encoder_warmup_steps = encoder_warmup_steps
         self.encoder_lr = encoder_lr
         self.forget_warmup_steps = forget_warmup_steps
         self.coeff_warmup_steps = coeff_warmup_steps
@@ -78,6 +144,57 @@ class LatentRMU(GradDiff):
     # ------------------------------------------------------------------ #
     #  Helpers                                                             #
     # ------------------------------------------------------------------ #
+
+    def _warmup_encoder(self, num_steps):
+        """Pre-align encoder direction r with the dontknow direction.
+
+        Runs `num_steps` of gradient descent on (1 - cos(r, dontknow))
+        using forget batches from the trainer's dataset. Only encoder
+        params are updated — model is forwarded in no_grad.
+        Purpose: start Phase 1 with r already on the right manifold,
+        so the joint loss converges instead of drifting (the issue we
+        saw where anchor_loss climbed 0.01 → 0.30 during Phase 1).
+        """
+        from torch.utils.data import DataLoader
+        if self.train_dataset is None or num_steps <= 0:
+            return
+        print(f"[encoder-warmup] aligning r with dontknow, {num_steps} steps", flush=True)
+        self.encoder.train()
+        opt = torch.optim.AdamW(self.encoder.parameters(), lr=self.encoder_lr)
+        loader = DataLoader(
+            self.train_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            collate_fn=self.data_collator,
+            shuffle=True,
+        )
+        device = next(self.encoder.parameters()).device
+
+        step = 0
+        last_loss = None
+        for batch in loader:
+            if step >= num_steps:
+                break
+            forget_inputs = {
+                k: batch["forget"][k].to(device)
+                for k in ("input_ids", "attention_mask", "labels")
+            }
+            with torch.no_grad():
+                h_forget, _ = self.forward_with_cache(
+                    self.model, forget_inputs, self.model_module, no_grad=True
+                )
+            pooled = h_forget.float().mean(dim=1)
+            r = self.encoder(pooled)
+            r_normed = r / (r.norm(dim=-1, keepdim=True) + 1e-8)
+            dontknow = self._get_dontknow_activations(forget_inputs)
+            anchor_loss = 1 - (r_normed * dontknow).sum(dim=-1).mean()
+            opt.zero_grad()
+            anchor_loss.backward()
+            opt.step()
+            last_loss = anchor_loss.item()
+            if step % 10 == 0:
+                print(f"[encoder-warmup] step {step:3d}/{num_steps}: 1 - cos(r, dontknow) = {last_loss:.4f}", flush=True)
+            step += 1
+        print(f"[encoder-warmup] done. final 1 - cos(r, dontknow) = {last_loss:.4f}", flush=True)
 
     def _get_dontknow_activations(self, forget_inputs):
         input_ids = forget_inputs["input_ids"].clone()
@@ -150,15 +267,24 @@ class LatentRMU(GradDiff):
         original_epochs = self.args.num_train_epochs
 
         self._phase = 1
+        # Phase 1 only updates the encoder — keep the entire model frozen.
+        # (Skipping the trainable_params_regex unfreeze here saves the
+        # gradient buffer on all matched layers; with regex=".*" that's
+        # the whole 1B model, which is what OOM'd phase 1 on forget10.)
         self._freeze_all_params(self.model, requires_grad=False)
-        self._set_trainable_params(self.model, self.trainable_params_regex, True)
+
+        if self.encoder_warmup_steps > 0:
+            self._warmup_encoder(self.encoder_warmup_steps)
+
         self.args.num_train_epochs = self.encoder_epochs
         super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
 
         if self.args.output_dir:
-            enc_path = os.path.join(self.args.output_dir, "encoder.pt")
-            torch.save(self.encoder.state_dict(), enc_path)
-            print(f"[phase1] saved encoder to {enc_path}", flush=True)
+            try:
+                _refresh_phase1_plot(self.args.output_dir, self.state.log_history)
+                print(f"[phase1] wrote {self.args.output_dir}/phase1_losses.png", flush=True)
+            except Exception as e:
+                print(f"[phase1] plot failed: {e}", flush=True)
 
         self._phase = 2
         self._freeze_all_params(self.encoder, requires_grad=False)
@@ -172,8 +298,9 @@ class LatentRMU(GradDiff):
 
     def create_optimizer(self):
         if self._phase == 1:
+            # Phase 1: only encoder is trainable. Model fully frozen — no
+            # gradient buffer required on any model parameter.
             self._freeze_all_params(self.model, requires_grad=False)
-            self._set_trainable_params(self.model, self.trainable_params_regex, True)
             optimizer_cls, _ = self.get_optimizer_cls_and_kwargs(self.args)
             self.optimizer = optimizer_cls(
                 self.encoder.parameters(),
@@ -217,7 +344,10 @@ class LatentRMU(GradDiff):
     #  Loss computation                                                    #
     # ------------------------------------------------------------------ #
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # transformers 4.46+ passes num_items_in_batch into compute_loss; we
+        # don't use it here (loss is already mean-reduced), so swallow it via
+        # **kwargs — same as SteerGRPO / reward_unlearn in this repo.
         forget_inputs = {k: inputs["forget"][k] for k in ("input_ids", "attention_mask", "labels")}
         retain_inputs = {k: inputs["retain"][k] for k in ("input_ids", "attention_mask", "labels")}
         mask = forget_inputs["labels"] != -100
@@ -231,86 +361,55 @@ class LatentRMU(GradDiff):
     # ---- Phase 1 ----------------------------------------------------- #
 
     def _phase1_loss(self, forget_inputs, retain_inputs, mask):
-        # Forward through model (gradient flows for conflict computation)
-        h_forget, _ = self.forward_with_cache(
-            self.model, forget_inputs, self.model_module, no_grad=False
-        )
-        # Forward through ref (no grad — used as fixed baseline)
+        # Phase 1 trains ONLY the encoder; the model is frozen. We don't
+        # need gradient through the model — gradient flows to the encoder
+        # via `target` (which depends on r). Forwarding with no_grad drops
+        # the saved-activation memory for the entire forget pass.
         with torch.no_grad():
+            h_forget, _ = self.forward_with_cache(
+                self.model, forget_inputs, self.model_module, no_grad=True
+            )
             h_forget_ref, _ = self.forward_with_cache(
                 self.ref_model, forget_inputs, self.ref_module, no_grad=True
             )
         h_forget_ref = h_forget_ref.to(h_forget.dtype)
 
-        # Encoder direction (gradient flows through r_normed)
+        # Encoder direction (gradient flows through r → encoder).
         r_normed, r_scaled = self._compute_steering(h_forget, self.steering_coeff)
-
-        # SAME target Phase 2 will use:
         target = self._build_steering_target(h_forget_ref, r_scaled)
 
-        # Detach target from MODEL's graph (we want gradient to flow back through
-        # h_forget — the model — and through r_scaled — the encoder — but NOT
-        # treat target as a moving goal during this MSE).
-        # Actually we want gradient through r_scaled (encoder), so we don't fully
-        # detach. Just detach h_forget_ref (already no_grad). r_scaled keeps grad.
+        # Phase-2 simulated forget MSE — replaces grad_conflict orth.
+        # Gradient flows back through r_scaled (encoder).
         forget_loss = self.compute_activation_loss(
             h_forget.float(), target.float(), mask
         )
 
-        # Retain NLL — gradient is non-zero (phase2 params have requires_grad)
-        retain_loss_for_conflict = self.model(**retain_inputs).loss
-
-        phase2_params = self._get_phase2_params()
-
-        grad_forget = torch.autograd.grad(
-            forget_loss, phase2_params,
-            create_graph=True, allow_unused=True, retain_graph=True,
-        )
-        grad_retain = torch.autograd.grad(
-            retain_loss_for_conflict, phase2_params,
-            create_graph=False, allow_unused=True,
-        )
-        grad_retain = [g.detach() if g is not None else None for g in grad_retain]
-
-        paired = [(a, b) for a, b in zip(grad_forget, grad_retain) if a is not None and b is not None]
-
-        # IDK anchor: pull r_normed toward dontknow direction
+        # IDK anchor: r_normed toward dontknow direction.
         dontknow_dirs = self._get_dontknow_activations(forget_inputs)
         anchor_loss = 1 - (r_normed * dontknow_dirs).sum(dim=-1).mean()
 
-        if not paired:
-            grad_conflict = torch.tensor(0.0, device=h_forget.device, requires_grad=True)
-            cos_sim_val = 0.0
-            gf_norm = gr_norm = 0.0
-        else:
-            g1 = torch.cat([a.flatten() for a, _ in paired])
-            g2 = torch.cat([b.flatten() for _, b in paired])
-            cos_sim = F.cosine_similarity(g1.unsqueeze(0), g2.unsqueeze(0)).squeeze()
-            grad_conflict = cos_sim ** 2
-            cos_sim_val = cos_sim.item()
-            gf_norm = g1.norm().item()
-            gr_norm = g2.norm().item()
-
         loss = (
-            self.orth_weight * grad_conflict
-            + self.anchor_weight * anchor_loss
+            self.anchor_weight * anchor_loss
+            + self.simulated_forget_weight * forget_loss
         )
 
-        # Diagnostic: how far is target from h_forget? Should be ~steering_coeff at init.
         with torch.no_grad():
             displacement = (target - h_forget).norm(dim=-1).mean().item()
+            r_norm_unnormed = r_normed.norm(dim=-1).mean().item()
 
         self.log({
-            "phase1/conflict_cos": cos_sim_val,
-            "phase1/conflict_cos2": grad_conflict.item(),
             "phase1/anchor_loss": anchor_loss.item(),
+            "phase1/cos_r_dontknow": 1.0 - anchor_loss.item(),
             "phase1/forget_loss_sim": forget_loss.item(),
-            "phase1/retain_nll": retain_loss_for_conflict.item(),
-            "phase1/r_norm_pre_normalize": (r_normed * (r_normed.norm(dim=-1, keepdim=True))).norm(dim=-1).mean().item(),
             "phase1/displacement_h_to_target": displacement,
-            "phase1/g_forget_norm": gf_norm,
-            "phase1/g_retain_norm": gr_norm,
+            "phase1/r_norm": r_norm_unnormed,
         })
+        self._phase1_log_count = getattr(self, "_phase1_log_count", 0) + 1
+        if self._phase1_log_count % 5 == 0:
+            try:
+                _refresh_phase1_plot(self.args.output_dir, self.state.log_history)
+            except Exception:
+                pass
         return loss
 
     # ---- Phase 2 ----------------------------------------------------- #
@@ -324,7 +423,7 @@ class LatentRMU(GradDiff):
                 self.ref_model, forget_inputs, self.ref_module, no_grad=True
             )
             # Same target construction as Phase 1
-            _, r_scaled = self._compute_steering(h_forget, self._ramped_steering_coeff())
+            _, r_scaled = self._compute_steering(h_forget_ref, self.steering_coeff)
             target = self._build_steering_target(h_forget_ref, r_scaled)
 
         target = target.expand_as(h_forget)

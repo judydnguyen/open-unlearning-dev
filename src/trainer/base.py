@@ -86,7 +86,50 @@ class FinetuneTrainer(Trainer):
         self.save_checkpoint_at_eval = save_checkpoint_at_eval
         self._best_forget_quality = -float("inf")
         self._custom_eval_skipped_warned = False
+        # transformers renamed `tokenizer` → `processing_class` in 4.46. Older
+        # 4.4x releases (e.g. 4.45.1, which sometimes ships in this env) reject
+        # `processing_class`; newer ones reject `tokenizer`. Inspect the actual
+        # HF Trainer signature once and forward under whichever name it accepts.
+        import inspect
+        _hf_trainer_params = inspect.signature(super().__init__).parameters
+        if "processing_class" in _hf_trainer_params:
+            if "tokenizer" in kwargs and "processing_class" not in kwargs:
+                kwargs["processing_class"] = kwargs.pop("tokenizer")
+        else:
+            # Older transformers — keep `tokenizer`, drop `processing_class` if set.
+            if "processing_class" in kwargs and "tokenizer" not in kwargs:
+                kwargs["tokenizer"] = kwargs.pop("processing_class")
+            kwargs.pop("processing_class", None)
+        # transformers 5.x rejects eval_strategy != no when eval_dataset is
+        # None. This repo uses custom evaluators (see self.evaluators) that
+        # do not require an HF eval_dataset. Flip the strategy to "no" for
+        # the duration of HF validation, then restore it so our overridden
+        # evaluate() still fires at the configured intervals.
+        _trainer_args = kwargs.get("args")
+        _saved_strategy = None
+        if (
+            evaluators is not None
+            and kwargs.get("eval_dataset") is None
+            and _trainer_args is not None
+        ):
+            _saved_strategy = getattr(_trainer_args, "eval_strategy", None)
+            if _saved_strategy not in (None, "no"):
+                _trainer_args.eval_strategy = "no"
         super().__init__(*args, **kwargs)
+        if _saved_strategy is not None and _saved_strategy not in (None, "no"):
+            self.args.eval_strategy = _saved_strategy
+
+    def __getattr__(self, name):
+        # Many places in this repo (SteerGRPO, evaluators, etc.) read
+        # `self.tokenizer`. transformers 5.x removed that attribute and
+        # only exposes `self.processing_class`. Fall back transparently so
+        # we don't have to rewrite every callsite.
+        if name == "tokenizer":
+            try:
+                return object.__getattribute__(self, "processing_class")
+            except AttributeError:
+                pass
+        raise AttributeError(name)
 
     def evaluate(
         self,
